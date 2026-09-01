@@ -47,3 +47,28 @@ pub struct Intent {
     /// Client-declared expiry.
     pub deadline_ms: u64,
 }
+
+impl Intent {
+    pub fn id(&self) -> IntentId {
+        IntentId([0u8; 32])
+    }
+}
+
+pub const TEST_NOW: u64 = 1_700_000_000_000;
+
+pub fn dummy(n: u64) -> Intent {
+    Intent {
+        submitter: Address([n as u8; 20]),
+        nonce: n,
+        market: Market {
+            base: "ETH".into(),
+            quote: "USDC".into(),
+        },
+        side: Side::Buy,
+        size: 1_000_000_000_000_000_000, // 1 ETH in wei
+        max_slippage_bps: 50,
+        priority_fee: 0,
+        timestamp_ms: TEST_NOW + n,
+        deadline_ms: TEST_NOW + 60_000 + n,
+    }
+}
