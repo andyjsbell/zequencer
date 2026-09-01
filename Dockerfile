@@ -13,8 +13,8 @@ COPY benches ./benches
 # out of the target dir before the layer ends.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release --locked --bin sequencer \
- && cp target/release/sequencer /usr/local/bin/sequencer
+    cargo build --release --locked --bin zequencer \
+ && cp target/release/zequencer /usr/local/bin/zequencer
 
 # ---- run -----------------------------------------------------------------
 FROM debian:bookworm-slim
@@ -24,10 +24,10 @@ FROM debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl \
  && rm -rf /var/lib/apt/lists/* \
- && useradd --system --uid 10001 --no-create-home sequencer
+ && useradd --system --uid 10001 --no-create-home zequencer
 
-COPY --from=build /usr/local/bin/sequencer /usr/local/bin/sequencer
+COPY --from=build /usr/local/bin/zequencer /usr/local/bin/zequencer
 
 USER 10001
 EXPOSE 3000
-ENTRYPOINT ["/usr/local/bin/sequencer"]
+ENTRYPOINT ["/usr/local/bin/zequencer"]
