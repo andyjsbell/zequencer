@@ -9,7 +9,7 @@ use serde::Serialize;
 /// The spec names `sequenced` and `included` as separate states. In this model
 /// they are the same event — an intent gains its ordering position at the
 /// moment its slot commitment is durably logged — so only `sequenced` exists.
-/// Splitting them needs a second anchoring step; see GAPS.md.
+/// Splitting them needs a second anchoring step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Lifecycle {

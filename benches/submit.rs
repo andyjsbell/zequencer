@@ -22,9 +22,8 @@ use zequencer::intent::Intent;
 use zequencer::log::MemLog;
 use zequencer::projection::{Projections, run_projector};
 use zequencer::prove::{BatchConfig, MockProver, Prover};
-use zequencer::sequencer::now_millis;
-use zequencer::sequencer::{GuaranteeConfig, Sequencer};
-use zequencer::testkit::live_intent;
+use zequencer::sequencer::{Sequencer, now_millis};
+use zequencer::testkit::{TEST_GUARANTEE, live_intent};
 
 const WARMUP: usize = 5_000;
 const SAMPLES: usize = 50_000;
@@ -145,7 +144,10 @@ fn burst(threads: usize) -> (f64, Duration) {
 /// averaged away.
 fn with_pipeline(batches: usize, per_batch: usize) -> Vec<f64> {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let guarantee = GuaranteeConfig::default();
+    // Not `default()`: that leaves the slot duration at zero, and
+    // `tokio::time::interval` panics on a zero period — so the sequencer died
+    // on its first tick and this section measured an unconsumed log.
+    let guarantee = TEST_GUARANTEE;
     let log = Arc::new(MemLog::new());
     let projections = Arc::new(RwLock::new(Projections::new(guarantee)));
     let adm = SyncMutex::new(Admission::default());
