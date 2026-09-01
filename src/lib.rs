@@ -32,3 +32,11 @@ pub mod projection;
 pub mod prove;
 pub mod receipt;
 pub mod sequencer;
+pub mod testkit;
+
+pub use admission::{Admission, Rejection};
+pub use attest::{Attester, MockEnclave};
+pub use log::{Entry, IntentLog, MemLog, Position, RedbLog};
+pub use projection::{Projections, run_projector};
+pub use prove::{BatchConfig, MockProver, Prover};
+pub use sequencer::{GuaranteeConfig, Sequencer};
