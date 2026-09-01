@@ -4,25 +4,11 @@ use crate::intent::{Address, Intent, IntentId};
 use crate::log::{Entry, IntentLog, LogError, Position};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex as SyncMutex;
+use crate::sequencer::Guarantee;
 
 /// Ceiling on declared slippage: 10_000 bps is 100%, and nothing above that
 /// means anything.
 pub const MAX_SLIPPAGE_BPS: u16 = 10_000;
-
-/// The inclusion promise made at admission: an admitted intent is sequenced
-/// within this window of its arrival, or dropped as `IntentExpired` rather than
-/// sequenced late.
-#[derive(Debug, Clone, Copy)]
-pub struct Guarantee {
-    pub window_ms: u64,
-}
-
-impl Guarantee {
-    /// The moment the promise made to an intent arriving at `now_ms` runs out.
-    pub fn deadline_for(&self, now_ms: u64) -> u64 {
-        now_ms + self.window_ms
-    }
-}
 
 pub struct Admission {
     guarantee: Guarantee,
