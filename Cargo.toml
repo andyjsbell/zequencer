@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+redb = "4.2.0"
+thiserror = "2.0.20"
+serde = { version = "1.0.229", features = ["derive"] }
+hex = "0.4.3"
+serde_with = { version = "3.22.0", default-features = false, features = ["std", "macros", "hex"] }
+tokio = { version = "1.53.1", features = ["full"] }
