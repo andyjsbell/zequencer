@@ -1,4 +1,4 @@
-# sequencer
+# zequencer
 
 A minimal simulator of a ZK-L2 sequencing flow: intents are admitted, ordered
 deterministically, given an inclusion guarantee, preconfirmed by a (mocked) TEE
