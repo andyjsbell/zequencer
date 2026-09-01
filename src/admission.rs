@@ -2,16 +2,16 @@
 
 use crate::intent::{Address, Intent, IntentId};
 use crate::log::{Entry, IntentLog, LogError, Position};
+use crate::sequencer::GuaranteeConfig;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex as SyncMutex;
-use crate::sequencer::Guarantee;
 
 /// Ceiling on declared slippage: 10_000 bps is 100%, and nothing above that
 /// means anything.
 pub const MAX_SLIPPAGE_BPS: u16 = 10_000;
 
 pub struct Admission {
-    guarantee: Guarantee,
+    guarantee: GuaranteeConfig,
     /// Every id admitted. Unbounded: a production gate would evict entries once
     /// they age past the longest guarantee window.
     seen: HashSet<IntentId>,
@@ -20,7 +20,7 @@ pub struct Admission {
 }
 
 impl Admission {
-    pub fn new(guarantee: Guarantee) -> Self {
+    pub fn new(guarantee: GuaranteeConfig) -> Self {
         Self {
             guarantee,
             seen: HashSet::new(),
@@ -140,16 +140,24 @@ mod tests {
     use crate::intent::{Market, TEST_NOW, dummy};
     use crate::log::MemLog;
     use std::thread;
+    use std::time::Duration;
     use tokio::sync::watch;
 
     /// Comfortably inside `dummy`'s 60s deadline, so the window rule only fires
     /// where a test means it to.
     const WINDOW_MS: u64 = 1_000;
 
-    fn gate() -> SyncMutex<Admission> {
-        SyncMutex::new(Admission::new(Guarantee {
+    /// Admission only ever consults `deadline_for`, so the slot cadence is
+    /// nominal here — it is the sequencer that acts on it.
+    fn guarantee() -> GuaranteeConfig {
+        GuaranteeConfig {
             window_ms: WINDOW_MS,
-        }))
+            slot_duration: Duration::from_millis(100),
+        }
+    }
+
+    fn gate() -> SyncMutex<Admission> {
+        SyncMutex::new(Admission::new(guarantee()))
     }
 
     fn rejection(err: AdmitError) -> Rejection {
@@ -265,9 +273,7 @@ mod tests {
     #[test]
     fn a_recorded_nonce_only_ever_advances() {
         let intent = dummy(0);
-        let mut adm = Admission::new(Guarantee {
-            window_ms: WINDOW_MS,
-        });
+        let mut adm = Admission::new(guarantee());
 
         adm.record(intent.id(), intent.submitter, 5);
         adm.record(intent.id(), intent.submitter, 9);
@@ -284,9 +290,7 @@ mod tests {
     fn submitters_have_independent_nonce_counters() {
         // `dummy` derives the submitter from `n`, so these are distinct accounts.
         let (one, other) = (dummy(1), dummy(2));
-        let mut adm = Admission::new(Guarantee {
-            window_ms: WINDOW_MS,
-        });
+        let mut adm = Admission::new(guarantee());
 
         adm.record(one.id(), one.submitter, 7);
         adm.record(other.id(), other.submitter, 1);
