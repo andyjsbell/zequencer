@@ -179,6 +179,139 @@ impl IntentLog for MemLog {
     }
 }
 
+const SCHEMA_VERSION: u16 = 1;
+
+const ENTRIES: TableDefinition<u64, &[u8]> = TableDefinition::new("entries");
+
+pub struct RedbLog {
+    db: Database,
+    /// Held across allocate-position → write → publish-head. Without it two
+    /// appends read the same head and the second silently overwrites the first;
+    /// the atomic alone only makes the read cheap, not the sequence atomic.
+    appending: std::sync::Mutex<()>,
+    /// Exclusive head — the position the next append takes.
+    head: AtomicU64,
+    doorbell: watch::Sender<Position>,
+}
+
+impl RedbLog {
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, LogError> {
+        let db = Database::create(path).map_err(|e| LogError::Encode(e.to_string()))?;
+
+        // Recover head from the table's last key.
+        let head = {
+            let tx = db
+                .begin_read()
+                .map_err(|e| LogError::Encode(e.to_string()))?;
+            match tx.open_table(ENTRIES) {
+                Ok(t) => t
+                    .last()
+                    .map_err(|e| LogError::Encode(e.to_string()))?
+                    .map(|(k, _)| k.value() + 1)
+                    .unwrap_or(0),
+                Err(_) => 0, // table doesn't exist yet
+            }
+        };
+
+        let (doorbell, _) = watch::channel(Position(head));
+        Ok(Self {
+            db,
+            appending: std::sync::Mutex::new(()),
+            head: AtomicU64::new(head),
+            doorbell,
+        })
+    }
+}
+
+impl IntentLog for RedbLog {
+    fn append(&self, entry: Entry) -> Result<Position, LogError> {
+        self.append_batch(vec![entry])
+    }
+
+    fn append_batch(&self, entries: Vec<Entry>) -> Result<Position, LogError> {
+        if entries.is_empty() {
+            return Err(LogError::EmptyBatch);
+        }
+        let _appending = self.appending.lock().expect("append lock poisoned");
+        let start = self.head.load(Ordering::Acquire);
+        let mut pos = start;
+
+        let tx = self
+            .db
+            .begin_write()
+            .map_err(|e| LogError::Encode(e.to_string()))?;
+        {
+            let mut table = tx
+                .open_table(ENTRIES)
+                .map_err(|e| LogError::Encode(e.to_string()))?;
+            for entry in &entries {
+                let bytes = encode(entry)?;
+                table
+                    .insert(pos, bytes.as_slice())
+                    .map_err(|e| LogError::Encode(e.to_string()))?;
+                pos += 1;
+            }
+        }
+        tx.commit().map_err(|e| LogError::Encode(e.to_string()))?; // durable here
+
+        self.head.store(pos, Ordering::Release);
+        self.doorbell.send_replace(Position(pos)); // ring after commit
+        Ok(Position(pos - 1))
+    }
+
+    fn read_from(
+        &self,
+        cursor: Position,
+    ) -> Result<impl Iterator<Item = (Position, Entry)> + '_, LogError> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| LogError::Encode(e.to_string()))?;
+        let table = match tx.open_table(ENTRIES) {
+            Ok(table) => table,
+            // The first append creates the table. Until then the log is empty,
+            // which is what a consumer rebuilding its cursor on a fresh
+            // database sees — not a failure. `open` treats it the same way.
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new().into_iter()),
+            Err(e) => return Err(LogError::Encode(e.to_string())),
+        };
+
+        let out: Vec<(Position, Entry)> = table
+            .range(cursor.0..)
+            .map_err(|e| LogError::Encode(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .map(|(k, v)| {
+                let pos = Position(k.value());
+                decode(v.value()).map(|e| (pos, e)).map_err(|_| pos)
+            })
+            .collect::<Result<Vec<_>, Position>>()
+            .map_err(LogError::Decode)?;
+
+        Ok(out.into_iter())
+    }
+
+    fn head(&self) -> Position {
+        Position(self.head.load(Ordering::Acquire))
+    }
+    fn subscribe(&self) -> watch::Receiver<Position> {
+        self.doorbell.subscribe()
+    }
+}
+
+fn encode(entry: &Entry) -> Result<Vec<u8>, LogError> {
+    let mut buf = SCHEMA_VERSION.to_le_bytes().to_vec();
+    buf.extend(postcard::to_stdvec(entry).map_err(|e| LogError::Encode(e.to_string()))?);
+    Ok(buf)
+}
+
+fn decode(bytes: &[u8]) -> Result<Entry, ()> {
+    let (ver, rest) = bytes.split_at(2);
+    if u16::from_le_bytes(ver.try_into().map_err(|_| ())?) != SCHEMA_VERSION {
+        return Err(());
+    }
+    postcard::from_bytes(rest).map_err(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
