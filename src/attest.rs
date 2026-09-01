@@ -38,6 +38,120 @@ fn encode_quote(slot: u64, commitment: Commitment, measurement: Measurement) -> 
     q
 }
 
+fn decode_quote(bytes: &[u8]) -> Result<(u64, Commitment, Measurement), VerifyError> {
+    if bytes.len() != QUOTE_LEN
+        || &bytes[..QUOTE_MAGIC.len()] != QUOTE_MAGIC
+        || bytes[QUOTE_MAGIC.len()] != QUOTE_VERSION
+    {
+        return Err(VerifyError::MalformedQuote);
+    }
+    let body = &bytes[QUOTE_MAGIC.len() + 1..];
+    Ok((
+        u64::from_le_bytes(body[..8].try_into().expect("fixed-width field")),
+        Commitment(body[8..40].try_into().expect("fixed-width field")),
+        Measurement(body[40..72].try_into().expect("fixed-width field")),
+    ))
+}
+
+/// A preconfirmation as it reaches its holder: the slot it claims, what that
+/// slot committed to, and the enclave's evidence for both. Borrowed, because
+/// every field comes straight off a `Receipt`.
+pub struct PreconfClaim<'a> {
+    pub slot: u64,
+    pub commitment: Commitment,
+    pub quote: &'a [u8],
+    pub signature: &'a Signature,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum VerifyError {
+    #[error("quote is not a well-formed attestation")]
+    MalformedQuote,
+    #[error("quote attests to slot {quoted}, but the claim is for slot {claimed}")]
+    SlotMismatch { claimed: u64, quoted: u64 },
+    #[error("quote attests to a different commitment than the claim")]
+    CommitmentMismatch,
+    #[error("the intents given do not reproduce the claimed commitment")]
+    ContentsMismatch,
+    #[error("quote is from untrusted build {0}")]
+    UntrustedMeasurement(Measurement),
+    #[error("signature does not cover the commitment")]
+    BadSignature,
+}
+
+/// The holder's trust root: which builds it will believe, and how it checks
+/// what they sign. A real deployment swaps in DCAP collateral and a real
+/// signature scheme; nothing above this line changes.
+pub trait Verifier {
+    fn trusts(&self, measurement: Measurement) -> bool;
+    fn signature_is_valid(&self, commitment: Commitment, signature: &Signature) -> bool;
+}
+
+/// Pins one build and accepts the mock enclave's signature scheme.
+pub struct MockVerifier {
+    pinned: Measurement,
+}
+
+impl Default for MockVerifier {
+    fn default() -> Self {
+        Self {
+            pinned: MOCK_MEASUREMENT,
+        }
+    }
+}
+
+impl MockVerifier {
+    /// Pin a different build, so a receipt from the wrong enclave is rejected
+    /// rather than assumed good.
+    pub fn pinning(measurement: Measurement) -> Self {
+        Self {
+            pinned: measurement,
+        }
+    }
+}
+
+impl Verifier for MockVerifier {
+    fn trusts(&self, measurement: Measurement) -> bool {
+        measurement == self.pinned
+    }
+    fn signature_is_valid(&self, commitment: Commitment, signature: &Signature) -> bool {
+        *signature == Signature::mock_over(&commitment.0)
+    }
+}
+
+/// Check a preconfirmation without asking the sequencer anything.
+///
+/// The contents are checked first and separately: a holder who was handed the
+/// wrong intents has a different problem from one handed a forged quote, and
+/// collapsing the two would report a valid attestation as a broken one.
+pub fn verify_preconf<V: Verifier>(
+    verifier: &V,
+    claim: &PreconfClaim<'_>,
+    intents: &[IntentId],
+) -> Result<(), VerifyError> {
+    if commit(claim.slot, intents) != claim.commitment {
+        return Err(VerifyError::ContentsMismatch);
+    }
+
+    let (slot, commitment, measurement) = decode_quote(claim.quote)?;
+    if slot != claim.slot {
+        return Err(VerifyError::SlotMismatch {
+            claimed: claim.slot,
+            quoted: slot,
+        });
+    }
+    if commitment != claim.commitment {
+        return Err(VerifyError::CommitmentMismatch);
+    }
+    if !verifier.trusts(measurement) {
+        return Err(VerifyError::UntrustedMeasurement(measurement));
+    }
+    if !verifier.signature_is_valid(commitment, claim.signature) {
+        return Err(VerifyError::BadSignature);
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EnclaveError {
     #[error("enclave unavailable: {0}")]
@@ -374,6 +488,276 @@ mod tests {
         fn a_measurement_displays_as_hex() {
             assert_eq!(MOCK_MEASUREMENT.to_string(), "5e".repeat(32));
             assert_eq!(Measurement([0; 32]).to_string().len(), 64);
+        }
+
+        #[test]
+        fn a_quote_round_trips_through_the_decoder() {
+            let commitment = commit(9, &ids(2));
+            let bytes = encode_quote(9, commitment, MOCK_MEASUREMENT);
+
+            assert_eq!(
+                decode_quote(&bytes),
+                Ok((9, commitment, MOCK_MEASUREMENT)),
+                "producer and verifier must read the same layout"
+            );
+        }
+
+        #[test]
+        fn the_decoder_rejects_anything_that_is_not_a_quote() {
+            let good = encode_quote(0, commit(0, &[]), MOCK_MEASUREMENT);
+
+            for (what, bytes) in [
+                ("empty", Vec::new()),
+                ("truncated", good[..QUOTE_LEN - 1].to_vec()),
+                ("overlong", [good.clone(), vec![0]].concat()),
+                ("wrong magic", {
+                    let mut b = good.clone();
+                    b[0] = b'X';
+                    b
+                }),
+                ("wrong version", {
+                    let mut b = good.clone();
+                    b[QUOTE_MAGIC.len()] = QUOTE_VERSION + 1;
+                    b
+                }),
+            ] {
+                assert_eq!(
+                    decode_quote(&bytes),
+                    Err(VerifyError::MalformedQuote),
+                    "a {what} quote must not decode"
+                );
+            }
+        }
+    }
+
+    // ── offline verification ────────────────────────────────────────
+
+    /// The path a receipt holder walks, with nothing from the sequencer beyond
+    /// the receipt itself.
+    mod verify {
+        use super::*;
+
+        /// A claim over `intents` in `slot`, as a well-behaved pipeline emits it.
+        fn honest(slot: u64, intents: &[IntentId]) -> (Commitment, Vec<u8>, Signature) {
+            let commitment = commit(slot, intents);
+            (
+                commitment,
+                encode_quote(slot, commitment, MOCK_MEASUREMENT),
+                Signature::mock_over(&commitment.0),
+            )
+        }
+
+        fn claim<'a>(
+            slot: u64,
+            commitment: Commitment,
+            quote: &'a [u8],
+            signature: &'a Signature,
+        ) -> PreconfClaim<'a> {
+            PreconfClaim {
+                slot,
+                commitment,
+                quote,
+                signature,
+            }
+        }
+
+        #[test]
+        fn an_honest_preconfirmation_verifies() {
+            let intents = ids(3);
+            let (commitment, quote, sig) = honest(4, &intents);
+
+            assert_eq!(
+                verify_preconf(
+                    &MockVerifier::default(),
+                    &claim(4, commitment, &quote, &sig),
+                    &intents
+                ),
+                Ok(())
+            );
+        }
+
+        #[test]
+        fn an_empty_slot_still_verifies() {
+            let (commitment, quote, sig) = honest(0, &[]);
+
+            assert_eq!(
+                verify_preconf(
+                    &MockVerifier::default(),
+                    &claim(0, commitment, &quote, &sig),
+                    &[]
+                ),
+                Ok(()),
+                "a slot that sequenced nothing is still a slot the enclave attested"
+            );
+        }
+
+        #[test]
+        fn intents_that_do_not_reproduce_the_commitment_are_rejected() {
+            let intents = ids(3);
+            let (commitment, quote, sig) = honest(4, &intents);
+            let c = claim(4, commitment, &quote, &sig);
+
+            for (what, wrong) in [
+                ("a different set", ids(2)),
+                ("an extra intent", ids(4)),
+                ("no intents at all", Vec::new()),
+                ("the same set reordered", {
+                    let mut r = intents.clone();
+                    r.swap(0, 2);
+                    r
+                }),
+            ] {
+                assert_eq!(
+                    verify_preconf(&MockVerifier::default(), &c, &wrong),
+                    Err(VerifyError::ContentsMismatch),
+                    "{what} must not pass as the slot's contents"
+                );
+            }
+        }
+
+        #[test]
+        fn the_contents_are_checked_before_the_evidence() {
+            // A claim that is wrong in both ways at once. The holder's problem is
+            // that they were handed the wrong intents, so that is what they hear.
+            let (commitment, _, sig) = honest(4, &ids(3));
+            let junk = vec![0u8; 4];
+
+            assert_eq!(
+                verify_preconf(
+                    &MockVerifier::default(),
+                    &claim(4, commitment, &junk, &sig),
+                    &ids(1)
+                ),
+                Err(VerifyError::ContentsMismatch)
+            );
+        }
+
+        #[test]
+        fn a_quote_for_another_slot_does_not_cover_this_one() {
+            let intents = ids(2);
+            let commitment = commit(4, &intents);
+            // The enclave's own quote, only for a slot the claim does not name.
+            let quote = encode_quote(5, commitment, MOCK_MEASUREMENT);
+            let sig = Signature::mock_over(&commitment.0);
+
+            assert_eq!(
+                verify_preconf(
+                    &MockVerifier::default(),
+                    &claim(4, commitment, &quote, &sig),
+                    &intents
+                ),
+                Err(VerifyError::SlotMismatch {
+                    claimed: 4,
+                    quoted: 5
+                })
+            );
+        }
+
+        #[test]
+        fn a_quote_over_another_commitment_does_not_cover_this_one() {
+            let intents = ids(2);
+            let commitment = commit(4, &intents);
+            let quote = encode_quote(4, Commitment([0xff; 32]), MOCK_MEASUREMENT);
+            let sig = Signature::mock_over(&commitment.0);
+
+            assert_eq!(
+                verify_preconf(
+                    &MockVerifier::default(),
+                    &claim(4, commitment, &quote, &sig),
+                    &intents
+                ),
+                Err(VerifyError::CommitmentMismatch),
+                "the quote is the evidence, so it must name the commitment being claimed"
+            );
+        }
+
+        #[test]
+        fn a_malformed_quote_is_rejected() {
+            let intents = ids(2);
+            let commitment = commit(4, &intents);
+            let sig = Signature::mock_over(&commitment.0);
+
+            assert_eq!(
+                verify_preconf(
+                    &MockVerifier::default(),
+                    &claim(4, commitment, b"not a quote", &sig),
+                    &intents
+                ),
+                Err(VerifyError::MalformedQuote)
+            );
+        }
+
+        #[test]
+        fn a_quote_from_an_unpinned_build_is_rejected() {
+            let intents = ids(2);
+            let impostor = Measurement([0xab; 32]);
+            let commitment = commit(4, &intents);
+            // Correct in every respect except the build that produced it.
+            let quote = encode_quote(4, commitment, impostor);
+            let sig = Signature::mock_over(&commitment.0);
+
+            assert_eq!(
+                verify_preconf(
+                    &MockVerifier::default(),
+                    &claim(4, commitment, &quote, &sig),
+                    &intents
+                ),
+                Err(VerifyError::UntrustedMeasurement(impostor)),
+                "an attestation is only worth the build it came from"
+            );
+        }
+
+        #[test]
+        fn a_verifier_pinned_to_another_build_rejects_the_mock_enclave() {
+            let intents = ids(2);
+            let (commitment, quote, sig) = honest(4, &intents);
+
+            assert_eq!(
+                verify_preconf(
+                    &MockVerifier::pinning(Measurement([0xab; 32])),
+                    &claim(4, commitment, &quote, &sig),
+                    &intents
+                ),
+                Err(VerifyError::UntrustedMeasurement(MOCK_MEASUREMENT)),
+                "the pin is the holder's policy, not the quote's claim about itself"
+            );
+        }
+
+        #[test]
+        fn a_signature_over_anything_else_is_rejected() {
+            let intents = ids(2);
+            let (commitment, quote, _) = honest(4, &intents);
+            let wrong = Signature::mock_over(b"something else");
+
+            assert_eq!(
+                verify_preconf(
+                    &MockVerifier::default(),
+                    &claim(4, commitment, &quote, &wrong),
+                    &intents
+                ),
+                Err(VerifyError::BadSignature)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_quote_the_mock_enclave_actually_produced_verifies() {
+            // End to end against the producer, so the two halves of the layout
+            // cannot drift apart without a test noticing.
+            let intents = ids(3);
+            let commitment = commit(7, &intents);
+            let q = MockEnclave::new()
+                .attest(7, &intents, commitment)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                verify_preconf(
+                    &MockVerifier::default(),
+                    &claim(7, commitment, &q.quote, &q.sig),
+                    &intents
+                ),
+                Ok(())
+            );
         }
     }
 
