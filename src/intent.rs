@@ -25,6 +25,13 @@ pub struct Market {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct IntentId(#[serde_as(as = "IfIsHumanReadable<Hex>")] pub [u8; 32]);
 
+impl IntentId {
+    pub fn parse(s: &str) -> Option<Self> {
+        let bytes: [u8; 32] = hex::decode(s).ok()?.try_into().ok()?;
+        Some(IntentId(bytes))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Intent {
     pub submitter: Address,

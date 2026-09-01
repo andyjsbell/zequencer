@@ -1,5 +1,7 @@
 //! The gate an intent passes to enter the protocol
 
+use axum::http::StatusCode;
+
 use crate::intent::{Address, Intent, IntentId};
 use crate::log::{Entry, IntentLog, LogError, Position};
 use crate::sequencer::GuaranteeConfig;
@@ -103,6 +105,16 @@ pub enum Rejection {
     Replay { intent_id: IntentId },
     #[error("nonce {got} does not advance past {last}")]
     StaleNonce { got: u64, last: u64 },
+}
+
+impl Rejection {
+    pub fn status(&self) -> StatusCode {
+        match self {
+            // A conflict with admitted history, not a malformed request.
+            Rejection::Replay { .. } | Rejection::StaleNonce { .. } => StatusCode::CONFLICT,
+            _ => StatusCode::BAD_REQUEST,
+        }
+    }
 }
 
 /// Failure from the admission
