@@ -279,9 +279,28 @@ Clock skew is unhandled.
 **`size` is `u128` base units.** JSON clients on 64-bit floats will need string
 encoding before this is real.
 
-**The bundled demo prover deliberately fails slots 20–29** (`main.rs`) so the
-failure path is visible in a live run: intents in those slots settle to `failed`
-rather than `final_proven`.
+**The demo prover can be told to refuse slot ranges**, so the failure path is
+visible in a live run rather than only in the tests:
+
+```bash
+FAIL_SLOTS=200-209 cargo run     # comma-separated; e.g. 200-209,400-409
+```
+
+Affected intents settle to `failed` with the backend's reason on the receipt;
+everything either side reaches `final_proven`.
+
+Note that the blast radius is a *batch*, not a slot. A proof covers the whole
+range it is asked for, so a backend that refuses slot 200 fails every batch
+overlapping it — with `batch_size: 10`, asking for `200-209` was measured to fail
+slots 194–218, across three batches whose boundaries do not line up with the
+request. That is how a real prover behaves, and it is why `SlotsProven` claims a
+contiguous range.
+
+The flag is **off by default** deliberately. Slots close on a timer whether or not anyone submits, so
+a slot range is really a window of *uptime* — at a 100 ms cadence, 200–209 is the
+one second starting ~20 s in. A hard-coded range therefore fails whatever happens
+to arrive during that second, which reads as a broken pipeline to anyone who did
+not know the range was there.
 
 ---
 
@@ -364,7 +383,7 @@ reverted, the test confirmed to fail.
 
 | invariant | test |
 |---|---|
-| No duplicate inclusion for one intent id | `concurrent_replays_admit_exactly_one` |
+| No duplicate inclusion for one intent id | `only_one_of_two_concurrent_replays_is_admitted` |
 | Monotonic nonce progression per submitter | `concurrent_same_nonce_admits_exactly_one` |
 | Deterministic ordering under concurrent submission | `ordering_is_deterministic_under_arrival_permutations` |
 | The status machine skips no transition | `proving_cannot_skip_attestation` |

@@ -1,7 +1,7 @@
 services:
-  sequencer:
+  zequencer:
     build: .
-    image: sequencer:latest
+    image: zequencer:latest
     ports:
       - "3000:3000"
     healthcheck:

@@ -11,17 +11,60 @@ use zequencer::{
     Sequencer, run_projector,
 };
 
+/// Slot ranges the demo prover should refuse, from `FAIL_SLOTS` — comma-separated
+/// `from-to`, as in `FAIL_SLOTS=200-209`.
+///
+/// Off by default. Slots close on a timer whether or not anyone submits, so a
+/// hard-coded range is really "these seconds of uptime": intents that happen to
+/// land in it settle to `failed`, which reads as a broken pipeline to anyone who
+/// did not know the range was there. Opt in when demonstrating the failure path.
+///
+/// Parsed strictly — a malformed value stops the process rather than silently
+/// disabling the thing the operator asked for.
+fn fail_slots() -> anyhow::Result<Vec<(u64, u64)>> {
+    let Ok(spec) = std::env::var("FAIL_SLOTS") else {
+        return Ok(Vec::new());
+    };
+    spec.split(',')
+        .map(str::trim)
+        .filter(|range| !range.is_empty())
+        .map(|range| {
+            let (from, to) = range
+                .split_once('-')
+                .ok_or_else(|| anyhow::anyhow!("FAIL_SLOTS range {range:?} is not `from-to`"))?;
+            let bound = |s: &str| -> anyhow::Result<u64> {
+                s.trim().parse().map_err(|_| {
+                    anyhow::anyhow!("FAIL_SLOTS range {range:?} has a non-numeric bound")
+                })
+            };
+            let (from, to) = (bound(from)?, bound(to)?);
+            if from > to {
+                anyhow::bail!("FAIL_SLOTS range {range:?} runs backwards");
+            }
+            Ok((from, to))
+        })
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let log = Arc::new(MemLog::new());
 
+    let fail_slots = fail_slots()?;
+    if !fail_slots.is_empty() {
+        // Without this the flag is invisible until a receipt comes back `failed`.
+        println!("demo prover will refuse these slot ranges: {fail_slots:?}");
+    }
+
     // Stated rather than defaulted: `GuaranteeConfig::default()` leaves the slot
     // duration at zero, and `tokio::time::interval` panics on a zero period, so
     // the sequencer died on its first tick and took the process with it.
+    // The 2 s window the README documents, stated as all three fields so they
+    // agree: 20 slots × 100 ms is exactly window_ms.
     let guarantee = GuaranteeConfig {
-        window_ms: 1_000,
+        window_ms: 2_000,
         slot_duration: Duration::from_millis(100),
-        max_slots: 10,
+        max_slots: 20,
     };
     let projections = Arc::new(RwLock::new(Projections::new(guarantee)));
 
@@ -46,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
         let log = log.clone();
         let backend = MockProver::new()
             .with_latency(Duration::from_millis(50)) // per slot
-            .failing_on([(20, 29)]); // this range will fail
+            .failing_on(fail_slots);
 
         let prover = Prover::new(
             backend,
