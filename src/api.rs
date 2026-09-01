@@ -59,7 +59,7 @@ impl IntoResponse for ApiError {
         };
         match self {
             // Structured body: a client branches on `reason` instead of parsing prose.
-            ApiError::Rejected(r) => (code, Json(r)).0.into_response(),
+            ApiError::Rejected(r) => (code, Json(r)).into_response(),
             other => (code, other.to_string()).into_response(),
         }
     }
