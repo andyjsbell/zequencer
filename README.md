@@ -2,7 +2,8 @@
 
 A minimal simulator of a ZK-L2 sequencing flow: intents are admitted, ordered
 deterministically, given an inclusion guarantee, preconfirmed by a (mocked) TEE
-and carried to a mocked final proof.
+and carried to a final proof — either a mocked one or a real Arkworks
+Groth16 proof of inclusion.
 
 There are no state transitions. Nothing is executed, matched or settled — the
 system proves *sequencing*, and every guarantee below is about ordering and
@@ -67,7 +68,9 @@ could be proven before it was attested and the preconfirmation was discarded.
 | `admission` | the gate an intent passes to enter the protocol |
 | `sequencer` | ordering policy and the inclusion guarantee |
 | `attest` | TEE preconfirmation, and its verification path |
-| `prove` | the final proof stage — `Prove` is the zkVM seam |
+| `prove` | the final proof stage — `Prove` is the pluggable backend seam |
+| `prove::inclusion` | Poseidon Merkle trees and the R1CS inclusion circuit |
+| `prove::groth16` | the Arkworks Groth16 backend over BN254 |
 | `projection` | the read model |
 | `receipt` / `api` | the client contract and its HTTP surface |
 
@@ -128,8 +131,12 @@ The evidence bundle.
  "guarantee":{"received_at_ms":…,"max_slots":2,"deadline_ms":…,
               "intent_deadline_ms":…,"state":"met","slot":1,"committed_at_ms":…},
  "preconf":{"slot":1,"commitment":"358bc971…","quote":"4d4f434b…","signature":"17e15c00…"},
- "proof":{"from_slot":0,"to_slot":4,"vkey_hash":"aaaa…","proof":"e449da9f…"}}
+ "proof":{"from_slot":0,"to_slot":4,"backend":"mock","vkey_hash":"aaaa…","proof":"e449da9f…"}}
 ```
+
+`proof.backend` names the proof system — `mock` or `groth16_bn254`. A client
+cannot check the bytes without it, and the backend is pluggable, so it travels
+with the proof rather than being assumed. See [Proof backends](#proof-backends).
 
 `sequence.index` is the rank inside the slot's ordering — not a log offset;
 `log_position` is arrival. `404` for an unknown id, `503` while the projector is
@@ -193,11 +200,107 @@ high-water mark. Clients resubmit with a fresh nonce.
 
 ---
 
+## Proof backends
+
+`Prove` is the seam. A backend owns three things that have to agree and cannot
+be mixed across backends: how a batch of slots becomes a *statement*, how that
+statement is discharged into proof bytes, and how those bytes are checked
+again. Proving and verifying live on the same trait for that reason — split
+across two, a caller could pair a proof with a verifier that never agreed on
+what was being proven.
+
+```rust
+trait Prove {
+    fn backend(&self) -> Backend;
+    async fn prove(&self, slots: &[CommittedSlot]) -> Result<ProofHandle, ProveFailure>;
+    fn verify(&self, handle: &ProofHandle, slots: &[CommittedSlot]) -> Result<(), VerifyFailure>;
+}
+```
+
+`verify` takes the slots, not just the handle. Every backend re-derives the
+statement from the ordered intent ids in the log and compares it to
+`handle.public_inputs` *before* checking the proof. A prover that proved
+something easier than what it was asked fails on that comparison — which is the
+failure that matters, and the one a verifier trusting the handle would miss.
+
+The two implementations are deliberately unalike, which is what keeps the seam
+from being shaped around one of them:
+
+| | `MockProver` | `Groth16Prover` |
+|---|---|---|
+| shape | zkVM-like: one opaque blob per batch | circuit-like: one proof per slot |
+| statement | the batch's commitments, in order | Merkle roots as field elements |
+| setup | none | trusted setup, verifying key pinned by hash |
+| verification | re-run the hash chain | pairing check per slot |
+| proves | nothing | Merkle inclusion |
+
+A real zkVM (SP1, Risc0) slots in where `MockProver` sits — swap the hash chain
+for a receipt and the pipeline does not change.
+
+### The inclusion circuit
+
+`commit()` commits a slot with Keccak, which is what the log and the attester
+carry. Keccak costs tens of thousands of constraints per block inside an
+arithmetic circuit, so the circuit commits the same intents a second way: a
+Poseidon Merkle tree over BN254's scalar field, where one hash is a few hundred
+constraints. Both commitments are functions of the same ordered `Vec<IntentId>`
+already in the log, so the Merkle root is recomputable and never trusted on the
+prover's word.
+
+A batch builds two levels:
+
+```text
+  intents of slot s ──► slot_root(s)
+                           │
+           slot_leaf(s, slot_root(s)) ──┐
+                                        ├──► batch_root
+           slot_leaf(s+1, ...) ─────────┘
+```
+
+and emits one Groth16 proof per slot, each showing *this slot's leaf is in the
+batch root*. Public inputs are `[root, leaf]`; the Merkle path is the witness.
+That is the honest fit between a fixed circuit and a variable-length batch —
+Groth16 proves one statement of one fixed shape, so `n` slots is `n` proofs
+rather than one proof that silently changes shape with `n`.
+
+The tree is fixed-depth (2^20 leaves) and zero-padded on the right. Fixed depth
+is what lets a single proving key serve every tree in the system: a slot with
+three intents and a batch with eight slots produce paths of the same length. It
+also closes the usual Merkle second-preimage hole — an internal node cannot be
+passed off as a leaf, because a path from the wrong level is the wrong length
+and no longer reaches the root. Padding costs nothing to store, since an
+all-zero subtree has the same hash at every level.
+
+Two details that are load-bearing rather than incidental:
+
+- **An intent id is hashed as two 128-bit halves, not reduced mod the field
+  order.** An id is 32 bytes and the scalar field is 254 bits, so reduction
+  would be lossy *and* grindable: an attacker choosing intent fields could
+  search for a second id that reduces onto a target. Hashing the halves is
+  injective over all 2^256 ids.
+- **A slot's root is bound to its slot number before entering the batch tree.**
+  Without it, two slots with identical contents produce identical leaves and a
+  proof for one passes for the other.
+
+The same circuit serves the client-facing case one level down:
+`prove_intent_inclusion` proves *this intent was in this slot* against the slot
+root rather than the batch root. Reusing it is why the depth is fixed rather
+than sized per tree.
+
+---
+
 ## Threat model (high level)
 
 **This is a simulator. It establishes no security property.** The mock signature
 is a keyed hash and the mock proof is a digest. What follows is where the trust
 would sit if they were real, and what is missing regardless.
+
+The Groth16 backend is the one exception, and only a partial one: the circuit
+and its proofs are real, but the trusted setup runs from a hard-coded seed
+(`SETUP_SEED`), so anyone who reads the source can forge proofs for it. A
+deployment needs a multi-party ceremony. Proof blinding is seeded the same way,
+which costs zero-knowledge — acceptable here only because everything the circuit
+proves is already public in the log.
 
 **Submission is unauthenticated — the largest gap.** `Intent` carries no
 signature, so `submitter` is a claimed address. Anyone can submit on anyone's
@@ -279,7 +382,7 @@ rather than `final_proven`.
 | target | runs | |
 |---|---|---|
 | `check` | `fmt` then `lint` then `test` | the gate — must pass before every commit |
-| `test` | `cargo test` | 180 tests: 174 unit, 6 end-to-end |
+| `test` | `cargo test` | 240 tests: 231 unit, 9 end-to-end |
 | `unit` | `cargo test --lib` | the in-module tests alone, no pipeline wiring |
 | `integration` | `cargo test --test pipeline -- --nocapture` | the end-to-end tests in `tests/` |
 | `pipeline` | `cargo run` | serves on :3000 |
