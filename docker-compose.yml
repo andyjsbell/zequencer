@@ -1,0 +1,17 @@
+services:
+  sequencer:
+    build: .
+    image: sequencer:latest
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+# No volume: main runs the in-memory log, so a restart deliberately starts from
+# an empty one. RedbLog is implemented and tested but not wired into main, so
+# there is nothing yet to persist.
