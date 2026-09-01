@@ -1,4 +1,7 @@
-use std::sync::RwLock;
+use redb::ReadableTable;
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_with::{IfIsHumanReadable, hex::Hex, serde_as};
 use crate::intent::{Intent, IntentId};
@@ -340,170 +343,410 @@ mod tests {
 
     /// The `(position, marker)` pairs `read_from` yields, which is what every
     /// consumer actually sees.
-    fn read_from(log: &MemLog, cursor: Position) -> Vec<(u64, u64)> {
+    fn read_from<L: IntentLog>(log: &L, cursor: Position) -> Vec<(u64, u64)> {
         log.read_from(cursor)
             .unwrap()
             .map(|(pos, e)| (pos.0, marker_of(&e)))
             .collect()
     }
 
-    #[test]
-    fn append_returns_the_position_written() {
-        let log = MemLog::new();
-        assert_eq!(log.append(received(0)).unwrap(), Position(0));
-        assert_eq!(log.append(received(1)).unwrap(), Position(1));
-        assert_eq!(log.append(received(2)).unwrap(), Position(2));
-    }
+    mod mem_log {
+        use super::*;
+        #[test]
+        fn append_returns_the_position_written() {
+            let log = MemLog::new();
+            assert_eq!(log.append(received(0)).unwrap(), Position(0));
+            assert_eq!(log.append(received(1)).unwrap(), Position(1));
+            assert_eq!(log.append(received(2)).unwrap(), Position(2));
+        }
 
-    #[test]
-    fn head_is_exclusive_and_zero_when_empty() {
-        let log = MemLog::new();
-        assert_eq!(log.head(), Position::ZERO);
-        let pos = log.append(received(0)).unwrap();
-        assert_eq!(log.head(), pos.next());
-    }
+        #[test]
+        fn head_is_exclusive_and_zero_when_empty() {
+            let log = MemLog::new();
+            assert_eq!(log.head(), Position::ZERO);
+            let pos = log.append(received(0)).unwrap();
+            assert_eq!(log.head(), pos.next());
+        }
 
-    #[test]
-    fn a_rejected_empty_batch_leaves_the_log_untouched() {
-        let log = MemLog::new();
-        let doorbell = log.subscribe();
-        assert!(matches!(
-            log.append_batch(Vec::new()),
-            Err(LogError::EmptyBatch)
-        ));
-        assert_eq!(log.head(), Position::ZERO);
-        assert!(!doorbell.has_changed().unwrap());
-    }
+        #[test]
+        fn a_rejected_empty_batch_leaves_the_log_untouched() {
+            let log = MemLog::new();
+            let doorbell = log.subscribe();
+            assert!(matches!(
+                log.append_batch(Vec::new()),
+                Err(LogError::EmptyBatch)
+            ));
+            assert_eq!(log.head(), Position::ZERO);
+            assert!(!doorbell.has_changed().unwrap());
+        }
 
-    #[test]
-    fn append_rings_the_doorbell_with_the_written_position() {
-        let log = MemLog::new();
-        let mut doorbell = log.subscribe();
+        #[test]
+        fn append_rings_the_doorbell_with_the_written_position() {
+            let log = MemLog::new();
+            let mut doorbell = log.subscribe();
 
-        let pos = log.append(received(0)).unwrap();
-        assert!(doorbell.has_changed().unwrap());
-        assert_eq!(*doorbell.borrow_and_update(), pos);
-    }
+            let pos = log.append(received(0)).unwrap();
+            assert!(doorbell.has_changed().unwrap());
+            assert_eq!(*doorbell.borrow_and_update(), pos);
+        }
 
-    #[test]
-    fn append_batch_rings_the_doorbell_once() {
-        let log = MemLog::new();
-        let mut doorbell = log.subscribe();
+        #[test]
+        fn append_batch_rings_the_doorbell_once() {
+            let log = MemLog::new();
+            let mut doorbell = log.subscribe();
 
-        let last = log.append_batch(vec![received(0), received(1)]).unwrap();
-        assert_eq!(*doorbell.borrow_and_update(), last);
-        assert!(
-            !doorbell.has_changed().unwrap(),
-            "one batch must not wake a consumer twice"
-        );
-    }
+            let last = log.append_batch(vec![received(0), received(1)]).unwrap();
+            assert_eq!(*doorbell.borrow_and_update(), last);
+            assert!(
+                !doorbell.has_changed().unwrap(),
+                "one batch must not wake a consumer twice"
+            );
+        }
 
-    #[test]
-    fn read_from_zero_yields_every_entry_with_its_position() {
-        let log = MemLog::new();
-        log.append_batch(vec![received(10), received(11), received(12)])
-            .unwrap();
-        assert_eq!(
-            read_from(&log, Position::ZERO),
-            vec![(0, 10), (1, 11), (2, 12)]
-        );
-    }
+        #[test]
+        fn read_from_zero_yields_every_entry_with_its_position() {
+            let log = MemLog::new();
+            log.append_batch(vec![received(10), received(11), received(12)])
+                .unwrap();
+            assert_eq!(
+                read_from(&log, Position::ZERO),
+                vec![(0, 10), (1, 11), (2, 12)]
+            );
+        }
 
-    #[test]
-    fn read_from_a_cursor_yields_only_the_tail() {
-        let log = MemLog::new();
-        log.append_batch(vec![received(10), received(11), received(12)])
-            .unwrap();
-        assert_eq!(read_from(&log, Position(2)), vec![(2, 12)]);
-    }
+        #[test]
+        fn read_from_a_cursor_yields_only_the_tail() {
+            let log = MemLog::new();
+            log.append_batch(vec![received(10), received(11), received(12)])
+                .unwrap();
+            assert_eq!(read_from(&log, Position(2)), vec![(2, 12)]);
+        }
 
-    #[test]
-    fn read_from_the_head_yields_nothing() {
-        let log = MemLog::new();
-        log.append(received(10)).unwrap();
-        assert!(read_from(&log, log.head()).is_empty());
-    }
+        #[test]
+        fn read_from_the_head_yields_nothing() {
+            let log = MemLog::new();
+            log.append(received(10)).unwrap();
+            assert!(read_from(&log, log.head()).is_empty());
+        }
 
-    #[test]
-    fn read_from_past_the_head_is_clamped_rather_than_panicking() {
-        let log = MemLog::new();
-        log.append(received(10)).unwrap();
-        assert!(read_from(&log, Position(99)).is_empty());
-    }
+        #[test]
+        fn read_from_past_the_head_is_clamped_rather_than_panicking() {
+            let log = MemLog::new();
+            log.append(received(10)).unwrap();
+            assert!(read_from(&log, Position(99)).is_empty());
+        }
 
-    #[test]
-    fn a_panic_under_the_lock_does_not_poison_the_log() {
-        let log = MemLog::new();
-        log.append(received(0)).unwrap();
+        #[test]
+        fn a_panic_under_the_lock_does_not_poison_the_log() {
+            let log = MemLog::new();
+            log.append(received(0)).unwrap();
 
-        let hook = panic::take_hook();
-        panic::set_hook(Box::new(|_| {}));
-        let panicked = panic::catch_unwind(AssertUnwindSafe(|| {
-            let _guard = log.write();
-            panic!("boom");
-        }));
-        panic::set_hook(hook);
-        assert!(panicked.is_err());
+            let hook = panic::take_hook();
+            panic::set_hook(Box::new(|_| {}));
+            let panicked = panic::catch_unwind(AssertUnwindSafe(|| {
+                let _guard = log.write();
+                panic!("boom");
+            }));
+            panic::set_hook(hook);
+            assert!(panicked.is_err());
 
-        assert_eq!(log.append(received(1)).unwrap(), Position(1));
-        assert_eq!(read_from(&log, Position::ZERO), vec![(0, 0), (1, 1)]);
-    }
+            assert_eq!(log.append(received(1)).unwrap(), Position(1));
+            assert_eq!(read_from(&log, Position::ZERO), vec![(0, 0), (1, 1)]);
+        }
 
-    #[test]
-    fn append_batch_matches_append_and_wakes_consumers() {
-        let log = MemLog::new();
-        // Subscribing marks the current head as seen, so any change observed
-        // after this point came from the append below.
-        let doorbell = log.subscribe();
+        #[test]
+        fn append_batch_matches_append_and_wakes_consumers() {
+            let log = MemLog::new();
+            // Subscribing marks the current head as seen, so any change observed
+            // after this point came from the append below.
+            let doorbell = log.subscribe();
 
-        let last = log.append_batch(vec![received(1), received(2)]).unwrap();
-        assert_eq!(
-            last,
-            Position(1),
-            "position of the last entry, as append returns"
-        );
-        assert_eq!(log.head(), Position(2));
-        assert!(
-            doorbell.has_changed().unwrap(),
-            "a batched append must wake consumers like a single one"
-        );
+            let last = log.append_batch(vec![received(1), received(2)]).unwrap();
+            assert_eq!(
+                last,
+                Position(1),
+                "position of the last entry, as append returns"
+            );
+            assert_eq!(log.head(), Position(2));
+            assert!(
+                doorbell.has_changed().unwrap(),
+                "a batched append must wake consumers like a single one"
+            );
 
-        assert!(matches!(
-            log.append_batch(vec![]),
-            Err(LogError::EmptyBatch)
-        ));
-    }
-    
-    #[test]
-    fn concurrent_appends_each_get_a_distinct_position() {
-        const THREADS: u64 = 8;
-        const PER_THREAD: u64 = 100;
+            assert!(matches!(
+                log.append_batch(vec![]),
+                Err(LogError::EmptyBatch)
+            ));
+        }
 
-        let log = MemLog::new();
-        let positions: Vec<Position> = thread::scope(|scope| {
-            let handles: Vec<_> = (0..THREADS)
-                .map(|t| {
-                    let log = &log;
-                    scope.spawn(move || {
-                        (0..PER_THREAD)
-                            .map(|i| log.append(received(t * PER_THREAD + i)).unwrap())
-                            .collect::<Vec<_>>()
+        #[test]
+        fn concurrent_appends_each_get_a_distinct_position() {
+            const THREADS: u64 = 8;
+            const PER_THREAD: u64 = 100;
+
+            let log = MemLog::new();
+            let positions: Vec<Position> = thread::scope(|scope| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|t| {
+                        let log = &log;
+                        scope.spawn(move || {
+                            (0..PER_THREAD)
+                                .map(|i| log.append(received(t * PER_THREAD + i)).unwrap())
+                                .collect::<Vec<_>>()
+                        })
                     })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().unwrap())
-                .collect()
-        });
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap())
+                    .collect()
+            });
 
-        let total = (THREADS * PER_THREAD) as usize;
-        assert_eq!(positions.len(), total);
-        assert_eq!(
-            positions.into_iter().collect::<HashSet<_>>().len(),
-            total,
-            "every append must own the position it returns"
-        );
-        assert_eq!(log.head(), Position(total as u64));
+            let total = (THREADS * PER_THREAD) as usize;
+            assert_eq!(positions.len(), total);
+            assert_eq!(
+                positions.into_iter().collect::<HashSet<_>>().len(),
+                total,
+                "every append must own the position it returns"
+            );
+            assert_eq!(log.head(), Position(total as u64));
+        }
+    }
+
+    /// `RedbLog` against a real database file. Everything here is about the two
+    /// things `MemLog` cannot show: that an append is durable past a reopen,
+    /// and that the head is rebuilt from the table rather than held in memory.
+    mod redb_log {
+        use super::*;
+        use tempfile::TempDir;
+
+        /// A database in a directory that is removed when the test ends. The
+        /// `TempDir` must outlive the log, so it is returned alongside it.
+        fn open() -> (TempDir, RedbLog) {
+            let dir = TempDir::new().unwrap();
+            let log = RedbLog::open(dir.path().join("log.redb")).unwrap();
+            (dir, log)
+        }
+
+        #[test]
+        fn a_fresh_database_starts_empty() {
+            let (_dir, log) = open();
+            assert_eq!(log.head(), Position::ZERO);
+            assert!(read_from(&log, Position::ZERO).is_empty());
+        }
+
+        #[test]
+        fn append_returns_the_position_written() {
+            let (_dir, log) = open();
+            assert_eq!(log.append(received(0)).unwrap(), Position(0));
+            assert_eq!(log.append(received(1)).unwrap(), Position(1));
+            assert_eq!(log.head(), Position(2));
+        }
+
+        #[test]
+        fn append_batch_returns_the_last_position_and_stores_the_whole_batch() {
+            let (_dir, log) = open();
+            log.append(received(0)).unwrap();
+
+            let last = log
+                .append_batch(vec![received(1), received(2), received(3)])
+                .unwrap();
+
+            assert_eq!(
+                last,
+                Position(3),
+                "position of the last entry, as append returns"
+            );
+            assert_eq!(log.head(), Position(4));
+            assert_eq!(
+                read_from(&log, Position::ZERO),
+                vec![(0, 0), (1, 1), (2, 2), (3, 3)],
+                "a batch occupies consecutive positions from the old head"
+            );
+        }
+
+        #[test]
+        fn a_rejected_empty_batch_leaves_the_log_untouched() {
+            let (_dir, log) = open();
+            log.append(received(0)).unwrap();
+            let doorbell = log.subscribe();
+
+            assert!(matches!(
+                log.append_batch(Vec::new()),
+                Err(LogError::EmptyBatch)
+            ));
+            assert_eq!(log.head(), Position(1));
+            assert!(!doorbell.has_changed().unwrap());
+        }
+
+        #[test]
+        fn a_batch_rings_the_doorbell_once_after_the_commit() {
+            let (_dir, log) = open();
+            let mut doorbell = log.subscribe();
+
+            log.append_batch(vec![received(0), received(1)]).unwrap();
+
+            assert!(doorbell.has_changed().unwrap());
+            // NOTE: `RedbLog` publishes the exclusive head here, where `MemLog`
+            // publishes the inclusive position of the last entry. This pins
+            // current behaviour; the two implementations disagree.
+            assert_eq!(*doorbell.borrow_and_update(), log.head());
+            assert!(
+                !doorbell.has_changed().unwrap(),
+                "one batch must not wake a consumer twice"
+            );
+        }
+
+        #[test]
+        fn read_from_a_cursor_yields_only_the_tail() {
+            let (_dir, log) = open();
+            log.append_batch(vec![received(10), received(11), received(12)])
+                .unwrap();
+
+            assert_eq!(
+                read_from(&log, Position::ZERO),
+                vec![(0, 10), (1, 11), (2, 12)]
+            );
+            assert_eq!(read_from(&log, Position(2)), vec![(2, 12)]);
+            assert!(read_from(&log, log.head()).is_empty());
+            assert!(read_from(&log, Position(99)).is_empty());
+        }
+
+        #[test]
+        fn entries_survive_a_reopen() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("log.redb");
+
+            {
+                let log = RedbLog::open(&path).unwrap();
+                log.append_batch(vec![received(10), received(11), received(12)])
+                    .unwrap();
+            } // closed
+
+            let log = RedbLog::open(&path).unwrap();
+            assert_eq!(
+                log.head(),
+                Position(3),
+                "head is recovered from the table's last key, not from memory"
+            );
+            assert_eq!(
+                read_from(&log, Position::ZERO),
+                vec![(0, 10), (1, 11), (2, 12)]
+            );
+        }
+
+        #[test]
+        fn a_reopened_log_appends_after_the_recovered_head() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("log.redb");
+
+            {
+                let log = RedbLog::open(&path).unwrap();
+                log.append(received(0)).unwrap();
+                log.append(received(1)).unwrap();
+            }
+
+            let log = RedbLog::open(&path).unwrap();
+            assert_eq!(
+                log.append(received(2)).unwrap(),
+                Position(2),
+                "the entry after a reopen must not overwrite an existing position"
+            );
+            assert_eq!(
+                read_from(&log, Position::ZERO),
+                vec![(0, 0), (1, 1), (2, 2)]
+            );
+        }
+
+        #[test]
+        fn a_reopened_log_starts_its_doorbell_at_the_recovered_head() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("log.redb");
+
+            {
+                let log = RedbLog::open(&path).unwrap();
+                log.append_batch(vec![received(0), received(1)]).unwrap();
+            }
+
+            let log = RedbLog::open(&path).unwrap();
+            let doorbell = log.subscribe();
+            assert_eq!(*doorbell.borrow(), Position(2));
+            assert!(
+                !doorbell.has_changed().unwrap(),
+                "a consumer must not be woken by entries that predate it"
+            );
+        }
+
+        #[test]
+        fn concurrent_appends_each_get_a_distinct_position() {
+            const THREADS: u64 = 4;
+            const PER_THREAD: u64 = 25;
+
+            let (_dir, log) = open();
+            let positions: Vec<Position> = thread::scope(|scope| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|t| {
+                        let log = &log;
+                        scope.spawn(move || {
+                            (0..PER_THREAD)
+                                .map(|i| log.append(received(t * PER_THREAD + i)).unwrap())
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap())
+                    .collect()
+            });
+
+            let total = (THREADS * PER_THREAD) as usize;
+            let mut sorted: Vec<u64> = positions.iter().map(|p| p.0).collect();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                (0..total as u64).collect::<Vec<_>>(),
+                "the append lock must hand every writer its own position, with no gaps"
+            );
+            assert_eq!(log.head(), Position(total as u64));
+            assert_eq!(
+                read_from(&log, Position::ZERO).len(),
+                total,
+                "no append may be overwritten by a concurrent one"
+            );
+        }
+    }
+
+    /// The on-disk codec `RedbLog` stores every entry through. Version-tagged,
+    /// so a schema change is rejected rather than silently mis-decoded.
+    mod codec {
+        use super::*;
+
+        #[test]
+        fn encode_then_decode_round_trips_an_entry() {
+            let decoded = decode(&encode(&received(7)).unwrap()).unwrap();
+            assert_eq!(marker_of(&decoded), 7);
+        }
+
+        #[test]
+        fn every_encoding_carries_the_schema_version() {
+            let bytes = encode(&received(0)).unwrap();
+            assert_eq!(&bytes[..2], &SCHEMA_VERSION.to_le_bytes());
+        }
+
+        #[test]
+        fn decode_rejects_a_different_schema_version() {
+            let mut bytes = encode(&received(0)).unwrap();
+            bytes[..2].copy_from_slice(&(SCHEMA_VERSION + 1).to_le_bytes());
+            assert!(decode(&bytes).is_err());
+        }
+
+        #[test]
+        fn decode_rejects_a_corrupt_payload() {
+            let mut bytes = encode(&received(0)).unwrap();
+            let payload = &mut bytes[2..];
+            payload.iter_mut().for_each(|b| *b = !*b);
+            assert!(decode(&bytes).is_err());
+        }
     }
 }
