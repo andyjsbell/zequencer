@@ -1,10 +1,10 @@
+use crate::intent::{Intent, IntentId};
 use redb::ReadableTable;
-use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::sync::atomic::{AtomicU64, Ordering};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_with::{IfIsHumanReadable, hex::Hex, serde_as};
-use crate::intent::{Intent, IntentId};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::watch;
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
