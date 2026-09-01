@@ -128,3 +128,53 @@ impl MemLog {
     }
 }
 
+impl IntentLog for MemLog {
+    fn append(&self, entry: Entry) -> Result<Position, LogError> {
+        let pos = {
+            let mut entries = self.write();
+            entries.push(entry);
+            Position(entries.len() as u64 - 1)
+        }; // lock dropped here, before signalling
+        self.doorbell.send_replace(pos);
+        Ok(pos)
+    }
+    fn append_batch(&self, entries: Vec<Entry>) -> Result<Position, LogError> {
+        if entries.is_empty() {
+            return Err(LogError::EmptyBatch);
+        }
+        // Same contract as `append`: the position of the last entry written,
+        // computed under the same lock, and the doorbell rung once afterwards.
+        // This used to return the exclusive length from a second lock and ring
+        // nothing, so a batched append woke no consumer.
+        let last = {
+            let mut guard = self.write();
+            guard.extend(entries);
+            Position(guard.len() as u64 - 1)
+        };
+        self.doorbell.send_replace(last);
+        Ok(last)
+    }
+    fn read_from(
+        &self,
+        cursor: Position,
+    ) -> Result<impl Iterator<Item = (Position, Entry)> + '_, LogError> {
+        // Copy only the tail past the cursor. Cloning the whole vector and then
+        // filtering makes every consumer wake-up cost O(log size) rather than
+        // O(new entries), which is quadratic across a run: four consumers each
+        // re-clone the entire log on every append.
+        let entries = self.read();
+        let start = (cursor.0 as usize).min(entries.len());
+        let tail: Vec<(Position, Entry)> = entries[start..]
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (Position((start + i) as u64), e.clone()))
+            .collect();
+        Ok(tail.into_iter())
+    }
+    fn head(&self) -> Position {
+        Position(self.read().len() as u64)
+    }
+    fn subscribe(&self) -> watch::Receiver<Position> {
+        self.doorbell.subscribe()
+    }
+}
