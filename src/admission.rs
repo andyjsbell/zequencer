@@ -1,12 +1,31 @@
 //! The gate an intent passes to enter the protocol
 
-use std::collections::{HashMap, HashSet};
 use crate::intent::{Address, Intent, IntentId};
 use crate::log::{Entry, IntentLog, LogError, Position};
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex as SyncMutex;
 
-#[derive(Default)]
+/// Ceiling on declared slippage: 10_000 bps is 100%, and nothing above that
+/// means anything.
+pub const MAX_SLIPPAGE_BPS: u16 = 10_000;
+
+/// The inclusion promise made at admission: an admitted intent is sequenced
+/// within this window of its arrival, or dropped as `IntentExpired` rather than
+/// sequenced late.
+#[derive(Debug, Clone, Copy)]
+pub struct Guarantee {
+    pub window_ms: u64,
+}
+
+impl Guarantee {
+    /// The moment the promise made to an intent arriving at `now_ms` runs out.
+    pub fn deadline_for(&self, now_ms: u64) -> u64 {
+        now_ms + self.window_ms
+    }
+}
+
 pub struct Admission {
+    guarantee: Guarantee,
     /// Every id admitted. Unbounded: a production gate would evict entries once
     /// they age past the longest guarantee window.
     seen: HashSet<IntentId>,
@@ -15,23 +34,57 @@ pub struct Admission {
 }
 
 impl Admission {
-    /// The gate's two rules: an intent is admitted once, and a submitter's
-    /// nonce must strictly advance. Checked under the same lock as the append,
-    /// so a concurrent submission cannot slip between the two.
-    fn check(&self, id: IntentId, submitter: Address, nonce: u64) -> Result<(), AdmitError> {
+    pub fn new(guarantee: Guarantee) -> Self {
+        Self {
+            guarantee,
+            seen: HashSet::new(),
+            nonces: HashMap::new(),
+        }
+    }
+
+    fn check(&self, id: IntentId, intent: &Intent, now_ms: u64) -> Result<(), Rejection> {
+        if intent.size == 0 {
+            return Err(Rejection::ZeroSize);
+        }
+        if intent.market.base.is_empty() || intent.market.quote.is_empty() {
+            return Err(Rejection::EmptyMarket);
+        }
+        if intent.max_slippage_bps > MAX_SLIPPAGE_BPS {
+            return Err(Rejection::SlippageOutOfRange {
+                got: intent.max_slippage_bps,
+                limit: MAX_SLIPPAGE_BPS,
+            });
+        }
+        if intent.deadline_ms <= now_ms {
+            return Err(Rejection::Expired {
+                deadline_ms: intent.deadline_ms,
+                now_ms,
+            });
+        }
+        // Refuse what cannot be promised: if the intent expires before the
+        // window closes, no honest guarantee covers it.
+        let guarantee_deadline_ms = self.guarantee.deadline_for(now_ms);
+        if intent.deadline_ms < guarantee_deadline_ms {
+            return Err(Rejection::UnmeetableWindow {
+                deadline_ms: intent.deadline_ms,
+                guarantee_deadline_ms,
+            });
+        }
         if self.seen.contains(&id) {
-            return Err(AdmitError::Duplicate(id));
+            return Err(Rejection::Replay { intent_id: id });
         }
-        // No entry means the first intent from this submitter, which any nonce
-        // may open.
-        match self.nonces.get(&submitter) {
-            Some(&highest) if nonce <= highest => Err(AdmitError::StaleNonce {
-                submitter,
-                nonce,
-                highest,
-            }),
-            _ => Ok(()),
+        // Strictly increasing, not gapless. Requiring `last + 1` would need a
+        // buffer holding future nonces until their predecessors arrive, which is
+        // mempool territory and out of scope.
+        if let Some(&last) = self.nonces.get(&intent.submitter)
+            && intent.nonce <= last
+        {
+            return Err(Rejection::StaleNonce {
+                got: intent.nonce,
+                last,
+            });
         }
+        Ok(())
     }
 
     fn record(&mut self, id: IntentId, submitter: Address, nonce: u64) {
@@ -40,19 +93,39 @@ impl Admission {
         *high = (*high).max(nonce);
     }
 }
+
+/// Why the gate turned an intent away. Distinct from `AdmitError::Log`: the
+/// submitter is at fault, and nothing is written.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum Rejection {
+    #[error("size must be non-zero")]
+    ZeroSize,
+    #[error("market base and quote must both be named")]
+    EmptyMarket,
+    #[error("slippage {got} bps exceeds the {limit} bps limit")]
+    SlippageOutOfRange { got: u16, limit: u16 },
+    #[error("deadline {deadline_ms} has already passed at {now_ms}")]
+    Expired { deadline_ms: u64, now_ms: u64 },
+    #[error(
+        "deadline {deadline_ms} falls inside the guarantee window ending {guarantee_deadline_ms}"
+    )]
+    UnmeetableWindow {
+        deadline_ms: u64,
+        guarantee_deadline_ms: u64,
+    },
+    #[error("intent {intent_id:?} has already been admitted")]
+    Replay { intent_id: IntentId },
+    #[error("nonce {got} does not advance past {last}")]
+    StaleNonce { got: u64, last: u64 },
+}
+
 /// Failure from the admission
 #[derive(Debug, thiserror::Error)]
 pub enum AdmitError {
     #[error(transparent)]
     Log(#[from] LogError),
-    #[error("intent {0:?} has already been admitted")]
-    Duplicate(IntentId),
-    #[error("nonce {nonce} for {submitter:?} does not advance past {highest}")]
-    StaleNonce {
-        submitter: Address,
-        nonce: u64,
-        highest: u64,
-    },
+    #[error(transparent)]
+    Rejected(#[from] Rejection),
 }
 
 /// Admit an intent and append it, atomically.
@@ -66,7 +139,7 @@ pub fn admit_and_append<L: IntentLog>(
     let (submitter, nonce) = (intent.submitter, intent.nonce);
 
     let mut adm = admission.lock().unwrap();
-    adm.check(intent_id, submitter, nonce)?;
+    adm.check(intent_id, &intent, now_ms)?;
     let pos = log.append(Entry::IntentReceived {
         intent_id,
         intent,
@@ -78,13 +151,26 @@ pub fn admit_and_append<L: IntentLog>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent::dummy;
+    use crate::intent::{Market, TEST_NOW, dummy};
     use crate::log::MemLog;
     use std::thread;
     use tokio::sync::watch;
 
+    /// Comfortably inside `dummy`'s 60s deadline, so the window rule only fires
+    /// where a test means it to.
+    const WINDOW_MS: u64 = 1_000;
+
     fn gate() -> SyncMutex<Admission> {
-        SyncMutex::new(Admission::default())
+        SyncMutex::new(Admission::new(Guarantee {
+            window_ms: WINDOW_MS,
+        }))
+    }
+
+    fn rejection(err: AdmitError) -> Rejection {
+        match err {
+            AdmitError::Rejected(r) => r,
+            AdmitError::Log(e) => panic!("expected a rejection, got a log error: {e}"),
+        }
     }
 
     /// The `(intent_id, received_at)` of every `IntentReceived` in the log, in
@@ -143,7 +229,7 @@ mod tests {
         let gate = gate();
         let intent = dummy(1);
 
-        let (id, pos) = admit_and_append(&log, &gate, intent.clone(), 100).unwrap();
+        let (id, pos) = admit_and_append(&log, &gate, intent.clone(), TEST_NOW).unwrap();
 
         assert_eq!(id, intent.id(), "the id is the intent's content hash");
         assert_eq!(pos, Position::ZERO);
@@ -156,11 +242,11 @@ mod tests {
         let gate = gate();
         let intent = dummy(1);
 
-        admit_and_append(&log, &gate, intent.clone(), 4_242).unwrap();
+        admit_and_append(&log, &gate, intent.clone(), TEST_NOW + 4_242).unwrap();
 
         assert_eq!(
             admitted(&log),
-            vec![(intent.id(), 4_242)],
+            vec![(intent.id(), TEST_NOW + 4_242)],
             "received_at is when the sequencer admitted it, not the client timestamp"
         );
     }
@@ -170,8 +256,8 @@ mod tests {
         let log = MemLog::new();
         let gate = gate();
 
-        let (_, first) = admit_and_append(&log, &gate, dummy(1), 100).unwrap();
-        let (_, second) = admit_and_append(&log, &gate, dummy(2), 101).unwrap();
+        let (_, first) = admit_and_append(&log, &gate, dummy(1), TEST_NOW).unwrap();
+        let (_, second) = admit_and_append(&log, &gate, dummy(2), TEST_NOW + 1).unwrap();
 
         assert_eq!((first, second), (Position(0), Position(1)));
         assert_eq!(admitted(&log).len(), 2);
@@ -183,7 +269,7 @@ mod tests {
         let gate = gate();
         let intent = dummy(3);
 
-        admit_and_append(&log, &gate, intent.clone(), 100).unwrap();
+        admit_and_append(&log, &gate, intent.clone(), TEST_NOW).unwrap();
 
         let adm = gate.lock().unwrap();
         assert!(adm.seen.contains(&intent.id()));
@@ -193,7 +279,9 @@ mod tests {
     #[test]
     fn a_recorded_nonce_only_ever_advances() {
         let intent = dummy(0);
-        let mut adm = Admission::default();
+        let mut adm = Admission::new(Guarantee {
+            window_ms: WINDOW_MS,
+        });
 
         adm.record(intent.id(), intent.submitter, 5);
         adm.record(intent.id(), intent.submitter, 9);
@@ -210,7 +298,9 @@ mod tests {
     fn submitters_have_independent_nonce_counters() {
         // `dummy` derives the submitter from `n`, so these are distinct accounts.
         let (one, other) = (dummy(1), dummy(2));
-        let mut adm = Admission::default();
+        let mut adm = Admission::new(Guarantee {
+            window_ms: WINDOW_MS,
+        });
 
         adm.record(one.id(), one.submitter, 7);
         adm.record(other.id(), other.submitter, 1);
@@ -225,7 +315,7 @@ mod tests {
         let gate = gate();
         let intent = dummy(1);
 
-        let err = admit_and_append(&log, &gate, intent.clone(), 100).unwrap_err();
+        let err = admit_and_append(&log, &gate, intent.clone(), TEST_NOW).unwrap_err();
 
         assert!(matches!(err, AdmitError::Log(_)));
         let adm = gate.lock().unwrap();
@@ -245,7 +335,11 @@ mod tests {
             let handles: Vec<_> = (0..THREADS)
                 .map(|n| {
                     let (log, gate) = (&log, &gate);
-                    scope.spawn(move || admit_and_append(log, gate, dummy(n), 100 + n).unwrap().1)
+                    scope.spawn(move || {
+                        admit_and_append(log, gate, dummy(n), TEST_NOW + n)
+                            .unwrap()
+                            .1
+                    })
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -272,17 +366,20 @@ mod tests {
         let log = MemLog::new();
         let gate = gate();
         let intent = dummy(1);
-        admit_and_append(&log, &gate, intent.clone(), 100).unwrap();
+        admit_and_append(&log, &gate, intent.clone(), TEST_NOW).unwrap();
 
-        let err = admit_and_append(&log, &gate, intent.clone(), 101).unwrap_err();
+        let err = admit_and_append(&log, &gate, intent.clone(), TEST_NOW + 1).unwrap_err();
 
-        assert!(
-            matches!(err, AdmitError::Duplicate(id) if id == intent.id()),
-            "a replay is a duplicate, not a stale nonce"
+        assert_eq!(
+            rejection(err),
+            Rejection::Replay {
+                intent_id: intent.id()
+            },
+            "a replay is caught as a replay, not as a stale nonce"
         );
         assert_eq!(
             admitted(&log),
-            vec![(intent.id(), 100)],
+            vec![(intent.id(), TEST_NOW)],
             "a rejected intent must not reach the log"
         );
     }
@@ -291,13 +388,17 @@ mod tests {
     fn a_nonce_must_strictly_advance() {
         let log = MemLog::new();
         let gate = gate();
-        admit_and_append(&log, &gate, with_nonce(1, 5), 100).unwrap();
+        admit_and_append(&log, &gate, with_nonce(1, 5), TEST_NOW).unwrap();
 
         for stale in [0, 4] {
-            let err = admit_and_append(&log, &gate, with_nonce(1, stale), 101).unwrap_err();
-            assert!(
-                matches!(err, AdmitError::StaleNonce { nonce, highest, .. }
-                    if nonce == stale && highest == 5),
+            let err =
+                admit_and_append(&log, &gate, with_nonce(1, stale), TEST_NOW + 1).unwrap_err();
+            assert_eq!(
+                rejection(err),
+                Rejection::StaleNonce {
+                    got: stale,
+                    last: 5
+                },
                 "nonce {stale} must not be admitted behind 5"
             );
         }
@@ -309,15 +410,8 @@ mod tests {
             priority_fee: 1,
             ..with_nonce(1, 5)
         };
-        let err = admit_and_append(&log, &gate, reuse, 102).unwrap_err();
-        assert!(matches!(
-            err,
-            AdmitError::StaleNonce {
-                nonce: 5,
-                highest: 5,
-                ..
-            }
-        ));
+        let err = admit_and_append(&log, &gate, reuse, TEST_NOW + 2).unwrap_err();
+        assert_eq!(rejection(err), Rejection::StaleNonce { got: 5, last: 5 });
 
         assert_eq!(admitted(&log).len(), 1);
     }
@@ -327,10 +421,10 @@ mod tests {
         let log = MemLog::new();
         let gate = gate();
 
-        admit_and_append(&log, &gate, with_nonce(1, 5), 100).unwrap();
-        admit_and_append(&log, &gate, with_nonce(1, 6), 101).unwrap();
+        admit_and_append(&log, &gate, with_nonce(1, 5), TEST_NOW).unwrap();
+        admit_and_append(&log, &gate, with_nonce(1, 6), TEST_NOW + 1).unwrap();
         // Strictly advancing, not contiguous: a gap is the submitter's business.
-        admit_and_append(&log, &gate, with_nonce(1, 99), 102).unwrap();
+        admit_and_append(&log, &gate, with_nonce(1, 99), TEST_NOW + 2).unwrap();
 
         assert_eq!(admitted(&log).len(), 3);
         assert_eq!(
@@ -344,8 +438,8 @@ mod tests {
         let log = MemLog::new();
         let gate = gate();
 
-        admit_and_append(&log, &gate, with_nonce(1, 0), 100).unwrap();
-        admit_and_append(&log, &gate, with_nonce(2, 7_000), 101).unwrap();
+        admit_and_append(&log, &gate, with_nonce(1, 0), TEST_NOW).unwrap();
+        admit_and_append(&log, &gate, with_nonce(2, 7_000), TEST_NOW + 1).unwrap();
 
         assert_eq!(admitted(&log).len(), 2);
     }
@@ -354,10 +448,10 @@ mod tests {
     fn one_submitters_nonce_does_not_gate_another() {
         let log = MemLog::new();
         let gate = gate();
-        admit_and_append(&log, &gate, with_nonce(1, 9), 100).unwrap();
+        admit_and_append(&log, &gate, with_nonce(1, 9), TEST_NOW).unwrap();
 
         // The same nonce from a different account is not stale.
-        admit_and_append(&log, &gate, with_nonce(2, 9), 101).unwrap();
+        admit_and_append(&log, &gate, with_nonce(2, 9), TEST_NOW + 1).unwrap();
 
         assert_eq!(admitted(&log).len(), 2);
     }
@@ -367,10 +461,10 @@ mod tests {
         let log = MemLog::new();
         let gate = gate();
         let admitted_intent = with_nonce(1, 5);
-        admit_and_append(&log, &gate, admitted_intent.clone(), 100).unwrap();
+        admit_and_append(&log, &gate, admitted_intent.clone(), TEST_NOW).unwrap();
 
-        admit_and_append(&log, &gate, with_nonce(1, 3), 101).unwrap_err();
-        admit_and_append(&log, &gate, admitted_intent.clone(), 102).unwrap_err();
+        admit_and_append(&log, &gate, with_nonce(1, 3), TEST_NOW + 1).unwrap_err();
+        admit_and_append(&log, &gate, admitted_intent.clone(), TEST_NOW + 2).unwrap_err();
 
         let adm = gate.lock().unwrap();
         assert_eq!(adm.seen.len(), 1, "a rejected intent is not marked seen");
@@ -392,7 +486,7 @@ mod tests {
             let handles: Vec<_> = (0..THREADS)
                 .map(|_| {
                     let (log, gate, intent) = (&log, &gate, intent.clone());
-                    scope.spawn(move || admit_and_append(log, gate, intent, 100).is_ok())
+                    scope.spawn(move || admit_and_append(log, gate, intent, TEST_NOW).is_ok())
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -403,6 +497,185 @@ mod tests {
             1,
             "check and append share one lock, so a racing replay cannot double-admit"
         );
+        assert_eq!(admitted(&log).len(), 1);
+    }
+
+    /// Submits `intent` to a fresh gate, asserts it was turned away without
+    /// writing anything, and hands back why.
+    fn rejected(intent: Intent, now_ms: u64) -> Rejection {
+        let log = MemLog::new();
+        let gate = gate();
+        let err = admit_and_append(&log, &gate, intent, now_ms).unwrap_err();
+        assert_eq!(
+            log.head(),
+            Position::ZERO,
+            "a rejected intent must never reach the log"
+        );
+        rejection(err)
+    }
+
+    /// Submits `intent` to a fresh gate and asserts it was admitted.
+    fn accepted(intent: Intent, now_ms: u64) {
+        let log = MemLog::new();
+        let gate = gate();
+        admit_and_append(&log, &gate, intent, now_ms).unwrap();
+        assert_eq!(log.head(), Position(1));
+    }
+
+    #[test]
+    fn an_intent_must_trade_something() {
+        assert_eq!(
+            rejected(
+                Intent {
+                    size: 0,
+                    ..dummy(1)
+                },
+                TEST_NOW
+            ),
+            Rejection::ZeroSize
+        );
+        accepted(
+            Intent {
+                size: 1,
+                ..dummy(1)
+            },
+            TEST_NOW,
+        );
+    }
+
+    #[test]
+    fn both_sides_of_the_market_must_be_named() {
+        let empty_base = Market {
+            base: String::new(),
+            quote: "USDC".into(),
+        };
+        let empty_quote = Market {
+            base: "ETH".into(),
+            quote: String::new(),
+        };
+        for market in [empty_base, empty_quote] {
+            assert_eq!(
+                rejected(Intent { market, ..dummy(1) }, TEST_NOW),
+                Rejection::EmptyMarket
+            );
+        }
+    }
+
+    #[test]
+    fn slippage_is_capped_at_the_limit_inclusive() {
+        assert_eq!(
+            rejected(
+                Intent {
+                    max_slippage_bps: MAX_SLIPPAGE_BPS + 1,
+                    ..dummy(1)
+                },
+                TEST_NOW
+            ),
+            Rejection::SlippageOutOfRange {
+                got: MAX_SLIPPAGE_BPS + 1,
+                limit: MAX_SLIPPAGE_BPS,
+            }
+        );
+        // The limit itself is admissible: 100% slippage is legal, if unwise.
+        accepted(
+            Intent {
+                max_slippage_bps: MAX_SLIPPAGE_BPS,
+                ..dummy(1)
+            },
+            TEST_NOW,
+        );
+    }
+
+    #[test]
+    fn an_intent_that_has_already_expired_is_rejected() {
+        // A deadline exactly at the clock has passed: the intent has no
+        // remaining life to sequence within.
+        assert_eq!(
+            rejected(
+                Intent {
+                    deadline_ms: TEST_NOW,
+                    ..dummy(1)
+                },
+                TEST_NOW
+            ),
+            Rejection::Expired {
+                deadline_ms: TEST_NOW,
+                now_ms: TEST_NOW,
+            }
+        );
+        assert!(matches!(
+            rejected(
+                Intent {
+                    deadline_ms: TEST_NOW - 1,
+                    ..dummy(1)
+                },
+                TEST_NOW
+            ),
+            Rejection::Expired { .. }
+        ));
+    }
+
+    #[test]
+    fn a_deadline_inside_the_guarantee_window_cannot_be_promised() {
+        let window_closes = TEST_NOW + WINDOW_MS;
+
+        assert_eq!(
+            rejected(
+                Intent {
+                    deadline_ms: window_closes - 1,
+                    ..dummy(1)
+                },
+                TEST_NOW
+            ),
+            Rejection::UnmeetableWindow {
+                deadline_ms: window_closes - 1,
+                guarantee_deadline_ms: window_closes,
+            },
+            "an intent that dies before the window closes is refused, not promised"
+        );
+        // Landing exactly on the window edge is still coverable.
+        accepted(
+            Intent {
+                deadline_ms: window_closes,
+                ..dummy(1)
+            },
+            TEST_NOW,
+        );
+    }
+
+    #[test]
+    fn validity_is_judged_before_history() {
+        let log = MemLog::new();
+        let gate = gate();
+        let intent = dummy(1);
+        admit_and_append(&log, &gate, intent.clone(), TEST_NOW).unwrap();
+
+        // Resubmitted long past its deadline: both the expiry and the replay
+        // rule apply, and the intent's own terms are reported first.
+        let err = admit_and_append(&log, &gate, intent, TEST_NOW + 120_000).unwrap_err();
+
+        assert!(matches!(rejection(err), Rejection::Expired { .. }));
+    }
+
+    #[test]
+    fn a_malformed_intent_records_nothing() {
+        let log = MemLog::new();
+        let gate = gate();
+
+        admit_and_append(
+            &log,
+            &gate,
+            Intent {
+                size: 0,
+                ..dummy(1)
+            },
+            TEST_NOW,
+        )
+        .unwrap_err();
+
+        // The nonce is free for reuse, which it would not be had the rejected
+        // intent been recorded.
+        admit_and_append(&log, &gate, dummy(1), TEST_NOW).unwrap();
         assert_eq!(admitted(&log).len(), 1);
     }
 }
