@@ -1,10 +1,10 @@
 CARGO ?= cargo
 
 .DEFAULT_GOAL := help
-.PHONY: help check test unit integration pipeline bench docker fmt lint clean
+.PHONY: help check test unit integration adversarial demo pipeline bench docker fmt lint clean
 
 help: ## List the available targets
-	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
+	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
 ## ── the gate ────────────────────────────────────────────────────────
 
@@ -21,10 +21,16 @@ unit: ## Run the in-module unit tests only
 integration: ## Run the end-to-end pipeline tests in tests/
 	$(CARGO) test --test pipeline -- --nocapture
 
+adversarial: ## Run the adversarial simulation — spam, races, forged submitters
+	$(CARGO) test --test adversarial -- --nocapture
+
 ## ── running ─────────────────────────────────────────────────────────
 
 pipeline: ## Serve the pipeline on :3000 — every stage running as a task
 	$(CARGO) run
+
+demo: ## Drive a whole intent over HTTP: submit, watch, receipt, replay
+	@./scripts/demo.sh
 
 docker: ## Serve the pipeline on :3000 in a container
 	docker compose up --build

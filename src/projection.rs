@@ -251,6 +251,7 @@ impl Projections {
             Some(ProofRef {
                 from_slot: pr.from_slot,
                 to_slot: pr.to_slot,
+                backend: pr.handle.backend.as_str(),
                 vkey_hash: hex::encode(pr.handle.vkey_hash),
                 proof: hex::encode(&pr.handle.proof),
             })
@@ -298,6 +299,7 @@ pub async fn run_projector<L: IntentLog>(log: Arc<L>, state: Arc<RwLock<Projecti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prove::Backend;
     use crate::{
         intent::dummy,
         sequencer::{GuaranteeConfig, commit, now_millis},
@@ -357,7 +359,9 @@ mod tests {
                 from_slot: 4,
                 to_slot: 5,
                 proof: ProofHandle {
+                    backend: Backend::Mock,
                     proof: vec![1, 2, 3],
+                    public_inputs: Vec::new(),
                     vkey_hash: [0xAA; 32],
                 },
             },
@@ -452,7 +456,9 @@ mod tests {
                 from_slot: 4,
                 to_slot: 4,
                 proof: ProofHandle {
+                    backend: Backend::Mock,
                     proof: vec![9],
+                    public_inputs: Vec::new(),
                     vkey_hash: [0xAA; 32],
                 },
             },

@@ -67,7 +67,7 @@ could be proven before it was attested and the preconfirmation was discarded.
 | `admission` | the gate an intent passes to enter the protocol |
 | `sequencer` | ordering policy and the inclusion guarantee |
 | `attest` | TEE preconfirmation, and its verification path |
-| `prove` | the final proof stage — `Prove` is the zkVM seam |
+| `prove` | the final proof stage — `Prove` is the pluggable backend seam |
 | `projection` | the read model |
 | `receipt` / `api` | the client contract and its HTTP surface |
 
@@ -128,8 +128,12 @@ The evidence bundle.
  "guarantee":{"received_at_ms":…,"max_slots":2,"deadline_ms":…,
               "intent_deadline_ms":…,"state":"met","slot":1,"committed_at_ms":…},
  "preconf":{"slot":1,"commitment":"358bc971…","quote":"4d4f434b…","signature":"17e15c00…"},
- "proof":{"from_slot":0,"to_slot":4,"vkey_hash":"aaaa…","proof":"e449da9f…"}}
+ "proof":{"from_slot":0,"to_slot":4,"backend":"mock","vkey_hash":"aaaa…","proof":"e449da9f…"}}
 ```
+
+`proof.backend` names the proof system that produced the bytes — `mock` here. A
+client cannot check them without it, and the backend is pluggable, so it travels
+with the proof rather than being assumed. See [Proof backends](#proof-backends).
 
 `sequence.index` is the rank inside the slot's ordering — not a log offset;
 `log_position` is arrival. `404` for an unknown id, `503` while the projector is
@@ -190,6 +194,41 @@ not a guarantee, and a stale intent is exactly what a client did not want filled
 A consequence worth stating: a dropped intent cannot be resubmitted verbatim —
 same content means the same id, so it hits `replay`, and its nonce is already the
 high-water mark. Clients resubmit with a fresh nonce.
+
+---
+
+## Proof backends
+
+`Prove` is the seam. A backend owns three things that have to agree and cannot
+be mixed across backends: how a batch of slots becomes a *statement*, how that
+statement is discharged into proof bytes, and how those bytes are checked
+again. Proving and verifying live on the same trait for that reason — split
+across two, a caller could pair a proof with a verifier that never agreed on
+what was being proven.
+
+```rust
+trait Prove {
+    fn backend(&self) -> Backend;
+    async fn prove(&self, slots: &[CommittedSlot]) -> Result<ProofHandle, ProveFailure>;
+    fn verify(&self, handle: &ProofHandle, slots: &[CommittedSlot]) -> Result<(), VerifyFailure>;
+}
+```
+
+`verify` takes the slots, not just the handle. Every backend re-derives the
+statement from the ordered intent ids in the log and compares it to
+`handle.public_inputs` *before* checking the proof. A prover that proved
+something easier than what it was asked fails on that comparison — which is the
+failure that matters, and the one a verifier trusting the handle would miss.
+
+`MockProver` is the only backend here, and it is zkVM-shaped: one opaque blob
+per batch, no public inputs to speak of, verified by re-running the same
+computation. It proves nothing — it stands in for a real prover so the rest of
+the pipeline can be exercised. A real zkVM (SP1, Risc0) slots in exactly where it
+sits: swap the hash chain for a receipt and nothing else changes.
+
+A circuit-shaped backend would sit beside it rather than replace it, adding its
+own `Backend` variant so a verifier reading an old log entry still knows what it
+is holding rather than guessing from the byte length.
 
 ---
 
@@ -311,10 +350,12 @@ not know the range was there.
 | target | runs | |
 |---|---|---|
 | `check` | `fmt` then `lint` then `test` | the gate — must pass before every commit |
-| `test` | `cargo test` | 197 tests: 174 unit, 17 adversarial, 6 end-to-end |
+| `test` | `cargo test` | 198 tests: 175 unit, 17 adversarial, 6 end-to-end |
 | `unit` | `cargo test --lib` | the in-module tests alone, no pipeline wiring |
 | `integration` | `cargo test --test pipeline -- --nocapture` | the end-to-end tests in `tests/` |
+| `adversarial` | `cargo test --test adversarial -- --nocapture` | spam, reordering, censorship, sequencer misbehaviour |
 | `pipeline` | `cargo run` | serves on :3000 |
+| `demo` | `./scripts/demo.sh` | drives one intent over HTTP: submit, watch, receipt, replay |
 | `docker` | `docker compose up --build` | the same service, containerised |
 | `bench` | `cargo bench --bench submit` | latency and throughput |
 | `fmt` | `cargo fmt --check` | reports, never rewrites |
