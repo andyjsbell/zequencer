@@ -104,6 +104,10 @@ pub struct PreconfRef {
 pub struct ProofRef {
     pub from_slot: u64,
     pub to_slot: u64,
+    /// Which proof system produced `proof`. A client cannot verify the bytes
+    /// without it, and the backend is pluggable, so it travels with the proof
+    /// rather than being assumed.
+    pub backend: &'static str,
     pub vkey_hash: String,
     pub proof: String,
 }
@@ -340,6 +344,7 @@ mod tests {
             ProofRef {
                 from_slot: 0,
                 to_slot: 9,
+                backend: "mock",
                 vkey_hash: "00ff".into(),
                 proof: "beef".into(),
             }
@@ -459,6 +464,7 @@ mod tests {
                 json!({
                     "from_slot": 0,
                     "to_slot": 9,
+                    "backend": "mock",
                     "vkey_hash": "00ff",
                     "proof": "beef",
                 }),

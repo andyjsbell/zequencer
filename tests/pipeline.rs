@@ -302,3 +302,150 @@ async fn the_attester_rules_on_each_slot_exactly_once() {
         .collect();
     assert_eq!(attested, vec![0, 1, 2, 3], "one SlotAttested per slot");
 }
+
+/// The backend seam, exercised end to end: the same pipeline, driven by a real
+/// Arkworks Groth16 circuit instead of the mock, with the resulting proof
+/// verified independently against what the log says the slots contained.
+mod groth16_backend {
+    use super::*;
+    use zequencer::intent::Intent;
+    use zequencer::prove::{Backend, CommittedSlot, Groth16Prover, Prove, VerifyFailure};
+
+    /// The proven range in the log, and the slot contents it covers —
+    /// reconstructed the way an independent verifier would, from the log alone.
+    fn proven_batch(log: &MemLog) -> Option<(zequencer::prove::ProofHandle, Vec<CommittedSlot>)> {
+        let entries: Vec<Entry> = log
+            .read_from(Position::ZERO)
+            .unwrap()
+            .map(|(_, e)| e)
+            .collect();
+
+        let (from_slot, to_slot, handle) = entries.iter().find_map(|e| match e {
+            Entry::SlotsProven {
+                from_slot,
+                to_slot,
+                proof,
+            } => Some((*from_slot, *to_slot, proof.clone())),
+            _ => None,
+        })?;
+
+        let slots = entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::SlotCommitted {
+                    slot,
+                    intents,
+                    commitment,
+                    ..
+                } if (from_slot..=to_slot).contains(slot) => Some(CommittedSlot {
+                    slot: *slot,
+                    intents: intents.clone(),
+                    commitment: *commitment,
+                }),
+                _ => None,
+            })
+            .collect();
+        Some((handle, slots))
+    }
+
+    async fn await_proof(log: &MemLog) -> (zequencer::prove::ProofHandle, Vec<CommittedSlot>) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if let Some(found) = proven_batch(log) {
+                    return found;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("no proof reached the log")
+    }
+
+    /// Run one intent through the whole pipeline under the Groth16 backend.
+    async fn run_one(prover: Groth16Prover, intent: Intent) -> Arc<MemLog> {
+        let log = Arc::new(MemLog::new());
+        tokio::spawn(Sequencer::new(TEST_GUARANTEE).run(log.clone()));
+        tokio::spawn(Attester::new(MockEnclave::new()).run(log.clone()));
+        tokio::spawn(
+            Prover::new(
+                prover,
+                BatchConfig {
+                    batch_size: 1,
+                    flush_after: Duration::from_millis(20),
+                },
+            )
+            .run(log.clone()),
+        );
+
+        log.append(Entry::IntentReceived {
+            intent_id: intent.id(),
+            intent,
+            received_at: now_millis(),
+        })
+        .unwrap();
+        log
+    }
+
+    #[tokio::test]
+    async fn a_real_circuit_backend_drives_the_pipeline_and_its_proof_verifies() {
+        // The setup is the expensive part, and both the pipeline's prover and
+        // this test's verifier have to be under the same verifying key.
+        let prover = Groth16Prover::setup().unwrap();
+
+        let log = run_one(prover.clone(), dummy(1)).await;
+        let (handle, slots) = await_proof(&log).await;
+
+        assert_eq!(handle.backend, Backend::Groth16Bn254);
+        assert_eq!(handle.vkey_hash, prover.vkey_hash());
+        assert!(!slots.is_empty(), "the proof has to cover a committed slot");
+        assert_eq!(
+            handle.public_inputs.len(),
+            32 * (slots.len() + 1),
+            "the batch root, then one Merkle root per slot"
+        );
+
+        assert_eq!(
+            prover.verify(&handle, &slots),
+            Ok(()),
+            "a verifier reading only the log must be able to check the proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_logged_proof_does_not_survive_editing_the_slot_it_covers() {
+        let prover = Groth16Prover::setup().unwrap();
+        let log = run_one(prover.clone(), dummy(2)).await;
+        let (handle, mut slots) = await_proof(&log).await;
+
+        // Rewriting history after the fact: the intent list is what the roots
+        // are built from, so the proof must stop matching.
+        slots[0].intents.push(dummy(99).id());
+
+        assert_eq!(
+            prover.verify(&handle, &slots),
+            Err(VerifyFailure::WrongStatement)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_intent_in_a_proven_slot_gets_its_own_inclusion_proof() {
+        // The client-facing use of the same circuit: not "this batch was
+        // proven" but "my intent was in it".
+        let prover = Groth16Prover::setup().unwrap();
+        let intent = dummy(3);
+        let id = intent.id();
+
+        let log = run_one(prover.clone(), intent).await;
+        let (_, slots) = await_proof(&log).await;
+        let slot = slots.iter().find(|s| s.intents.contains(&id)).unwrap();
+
+        let claim = prover.prove_intent_inclusion(slot, id).unwrap();
+
+        assert_eq!(claim.intent, id);
+        assert_eq!(claim.slot, slot.slot);
+        assert_eq!(
+            prover.verify_intent_inclusion(&claim, &slot.intents),
+            Ok(())
+        );
+    }
+}

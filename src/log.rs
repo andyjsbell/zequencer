@@ -188,7 +188,9 @@ impl IntentLog for MemLog {
     }
 }
 
-const SCHEMA_VERSION: u16 = 1;
+// Bumped to 2 when `ProofHandle` gained `backend` and `public_inputs`. A v1
+// entry decodes into the new shape as garbage, so it is rejected instead.
+const SCHEMA_VERSION: u16 = 2;
 
 const ENTRIES: TableDefinition<u64, &[u8]> = TableDefinition::new("entries");
 

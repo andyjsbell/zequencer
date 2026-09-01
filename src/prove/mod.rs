@@ -1,4 +1,25 @@
-//! The final proof stage. `Prove` is the seam a real zkVM backend slots into.
+//! The final proof stage.
+//!
+//! # The backend seam
+//!
+//! [`Prove`] is the whole abstraction. A backend owns three things that have to
+//! agree with each other and cannot be mixed between backends: how a batch of
+//! slots becomes a *statement*, how that statement is discharged into proof
+//! bytes, and how those bytes are checked again. Splitting proving from
+//! verifying across two unrelated traits would let a caller pair a proof with a
+//! verifier that never agreed on the statement, so both live here.
+//!
+//! Two shapes are implemented, and they are deliberately unalike — that is what
+//! keeps the seam honest rather than shaped around one backend:
+//!
+//! - [`MockProver`] is zkVM-shaped: one opaque blob per batch, no public inputs
+//!   to speak of, verified by re-running the same computation. A real zkVM
+//!   (SP1, Risc0) slots in exactly here — swap the hash chain for a receipt.
+//! - [`Groth16Prover`] is circuit-shaped: a fixed arithmetic circuit, a trusted
+//!   setup whose verifying key must be pinned, explicit field-element public
+//!   inputs, and one proof per claim rather than one per batch.
+//!
+//! [`Groth16Prover`]: crate::prove::groth16::Groth16Prover
 use crate::intent::IntentId;
 use crate::log::{Commitment, Entry, IntentLog, LogError, Position};
 use serde::{Deserialize, Serialize};
@@ -9,21 +30,66 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
 
+pub mod groth16;
+pub mod inclusion;
+
+pub use groth16::Groth16Prover;
+
 pub struct CommittedSlot {
     pub slot: u64,
     pub intents: Vec<IntentId>,
     pub commitment: Commitment,
 }
 
+/// Which proof system produced a handle. Persisted in the log, so a verifier
+/// reading an old entry knows what it is holding rather than guessing from the
+/// byte length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    /// Hash chain over the batch's commitments. Proves nothing; stands in for a
+    /// zkVM in tests and benches.
+    Mock,
+    /// Arkworks Groth16 over BN254, proving Merkle inclusion of each slot root
+    /// in the batch root.
+    Groth16Bn254,
+}
+
+impl Backend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Backend::Mock => "mock",
+            Backend::Groth16Bn254 => "groth16_bn254",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofHandle {
+    pub backend: Backend,
+    /// Backend-opaque proof bytes.
     pub proof: Vec<u8>,
+    /// The statement the proof discharges, encoded as the backend's verifier
+    /// wants it. Every backend re-derives this from the slots before checking a
+    /// proof against it — a verifier that trusted the field would be verifying
+    /// the prover's claim about its own work.
+    pub public_inputs: Vec<u8>,
+    /// Pins the verifying key. A proof under a different key is a proof about a
+    /// different circuit, whatever it says about itself.
     pub vkey_hash: [u8; 32],
 }
 
 #[async_trait::async_trait]
 pub trait Prove: Send + Sync {
+    fn backend(&self) -> Backend;
+
     async fn prove(&self, slots: &[CommittedSlot]) -> Result<ProofHandle, ProveFailure>;
+
+    /// Re-derive the statement from `slots` and check `handle` against it.
+    ///
+    /// Takes the slots rather than trusting `handle.public_inputs`, so a
+    /// prover cannot pass by proving something easier than what it was asked.
+    fn verify(&self, handle: &ProofHandle, slots: &[CommittedSlot]) -> Result<(), VerifyFailure>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +98,22 @@ pub enum ProveFailure {
     Backend(String),
     #[error("timed out after {0:?}")]
     Timeout(Duration),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum VerifyFailure {
+    #[error("handle is from the {got:?} backend, this verifier is {want:?}")]
+    WrongBackend { want: Backend, got: Backend },
+    #[error("verifying key mismatch: the proof is about a different circuit")]
+    WrongVerifyingKey,
+    /// The proof is internally valid but does not discharge the statement these
+    /// slots make. This is the case that catches a prover proving the wrong thing.
+    #[error("proof does not match the statement these slots make")]
+    WrongStatement,
+    #[error("proof bytes are malformed")]
+    Malformed,
+    #[error("proof is invalid")]
+    Invalid,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -216,8 +298,30 @@ impl MockProver {
     }
 }
 
+/// The mock's verifying key. Fixed, because there is no setup to derive one from.
+pub const MOCK_VKEY_HASH: [u8; 32] = [0xAA; 32];
+
+impl MockProver {
+    /// The batch's commitments in order — what the mock's "proof" is over.
+    fn statement(slots: &[CommittedSlot]) -> Vec<u8> {
+        slots.iter().flat_map(|s| s.commitment.0).collect()
+    }
+
+    fn chain(slots: &[CommittedSlot]) -> Vec<u8> {
+        let mut h = Keccak256::new();
+        for s in slots {
+            h.update(s.commitment.0);
+        }
+        h.finalize().to_vec()
+    }
+}
+
 #[async_trait::async_trait]
 impl Prove for MockProver {
+    fn backend(&self) -> Backend {
+        Backend::Mock
+    }
+
     async fn prove(&self, slots: &[CommittedSlot]) -> Result<ProofHandle, ProveFailure> {
         let from = slots.first().expect("empty batch").slot;
         let to = slots.last().unwrap().slot;
@@ -231,15 +335,33 @@ impl Prove for MockProver {
             )));
         }
 
-        let mut h = Keccak256::new();
-        for s in slots {
-            h.update(s.commitment.0);
-        }
-
         Ok(ProofHandle {
-            proof: h.finalize().to_vec(), // stand-in for a real proof blob
-            vkey_hash: [0xAA; 32],
+            backend: Backend::Mock,
+            proof: Self::chain(slots), // stand-in for a real proof blob
+            public_inputs: Self::statement(slots),
+            vkey_hash: MOCK_VKEY_HASH,
         })
+    }
+
+    /// Re-runs the chain. A zkVM backend checks a receipt here instead; the
+    /// shape of the call is the same, which is the point of the seam.
+    fn verify(&self, handle: &ProofHandle, slots: &[CommittedSlot]) -> Result<(), VerifyFailure> {
+        if handle.backend != Backend::Mock {
+            return Err(VerifyFailure::WrongBackend {
+                want: Backend::Mock,
+                got: handle.backend,
+            });
+        }
+        if handle.vkey_hash != MOCK_VKEY_HASH {
+            return Err(VerifyFailure::WrongVerifyingKey);
+        }
+        if handle.public_inputs != Self::statement(slots) {
+            return Err(VerifyFailure::WrongStatement);
+        }
+        if handle.proof != Self::chain(slots) {
+            return Err(VerifyFailure::Invalid);
+        }
+        Ok(())
     }
 }
 
@@ -290,7 +412,9 @@ mod tests {
             from_slot,
             to_slot,
             proof: ProofHandle {
+                backend: Backend::Mock,
                 proof: Vec::new(),
+                public_inputs: Vec::new(),
                 vkey_hash: [0; 32],
             },
         }
@@ -356,7 +480,8 @@ mod tests {
             h.update(batch[0].commitment.0);
             h.update(batch[1].commitment.0);
             assert_eq!(handle.proof, h.finalize().to_vec());
-            assert_eq!(handle.vkey_hash, [0xAA; 32]);
+            assert_eq!(handle.vkey_hash, MOCK_VKEY_HASH);
+            assert_eq!(handle.backend, Backend::Mock);
         }
 
         #[tokio::test]

@@ -20,7 +20,9 @@
 //!   honours the inclusion guarantee by dropping what it cannot reach in time.
 //! - [`attest`] signs committed slots inside a (mocked) enclave.
 //! - [`prove`] batches attested slots into proofs. It consumes attestations,
-//!   not commitments, so it runs strictly behind the attester.
+//!   not commitments, so it runs strictly behind the attester. The backend is
+//!   pluggable: [`MockProver`] stands in for a zkVM, [`Groth16Prover`] is a
+//!   real Arkworks circuit proving Merkle inclusion of every slot in a batch.
 //! - [`projection`] is a read model rebuilt from the log; it persists nothing.
 
 pub mod admission;
@@ -38,5 +40,5 @@ pub use admission::{Admission, Rejection};
 pub use attest::{Attester, MockEnclave};
 pub use log::{Entry, IntentLog, MemLog, Position, RedbLog};
 pub use projection::{Projections, run_projector};
-pub use prove::{BatchConfig, MockProver, Prover};
+pub use prove::{Backend, BatchConfig, Groth16Prover, MockProver, Prover, VerifyFailure};
 pub use sequencer::{GuaranteeConfig, Sequencer};
