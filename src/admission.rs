@@ -102,7 +102,8 @@ impl Admission {
 
 /// Why the gate turned an intent away. Distinct from `AdmitError::Log`: the
 /// submitter is at fault, and nothing is written.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
 pub enum Rejection {
     #[error("size must be non-zero")]
     ZeroSize,
@@ -519,6 +520,56 @@ mod tests {
             "check and append share one lock, so a racing replay cannot double-admit"
         );
         assert_eq!(admitted(&log).len(), 1);
+    }
+
+    #[test]
+    fn concurrent_same_nonce_admits_exactly_one() {
+        const THREADS: u64 = 8;
+
+        // Distinct intents at the *same* nonce from one submitter: the fee feeds
+        // the id, so these are eight different ids racing the nonce rule rather
+        // than the replay set. That is the branch the replay test above cannot
+        // reach — it submits one intent eight times, which is caught by id.
+        let log = MemLog::new();
+        let gate = gate();
+        let contenders: Vec<Intent> = (0..THREADS)
+            .map(|fee| Intent {
+                priority_fee: fee,
+                ..with_nonce(1, 7)
+            })
+            .collect();
+        assert_eq!(
+            contenders
+                .iter()
+                .map(|i| i.id())
+                .collect::<HashSet<_>>()
+                .len(),
+            THREADS as usize,
+            "the contenders must be distinct intents, or this races the replay rule instead"
+        );
+
+        let outcomes: Vec<bool> = thread::scope(|scope| {
+            let handles: Vec<_> = contenders
+                .into_iter()
+                .map(|intent| {
+                    let (log, gate) = (&log, &gate);
+                    scope.spawn(move || admit_and_append(log, gate, intent, TEST_NOW).is_ok())
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        assert_eq!(
+            outcomes.iter().filter(|ok| **ok).count(),
+            1,
+            "one lock spans check and append, so a nonce cannot be consumed twice"
+        );
+        assert_eq!(admitted(&log).len(), 1);
+        assert_eq!(
+            gate.lock().unwrap().nonces.get(&dummy(1).submitter),
+            Some(&7),
+            "the winner set the high-water mark and the losers left it alone"
+        );
     }
 
     /// Submits `intent` to a fresh gate, asserts it was turned away without
