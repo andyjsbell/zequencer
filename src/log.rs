@@ -1,4 +1,5 @@
 use crate::intent::{Intent, IntentId};
+use crate::prove::ProofHandle;
 use redb::ReadableTable;
 use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
