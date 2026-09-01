@@ -178,3 +178,199 @@ impl IntentLog for MemLog {
         self.doorbell.subscribe()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intent::dummy;
+    use std::collections::HashSet;
+    use std::panic::{self, AssertUnwindSafe};
+    use std::thread;
+
+    fn received(n: u64) -> Entry {
+        let intent = dummy(n);
+        Entry::IntentReceived {
+            intent_id: intent.id(),
+            intent,
+            received_at: n,
+        }
+    }
+
+    /// `Entry` has no `PartialEq`, so `received_at` carries the identity a test
+    /// gave the entry.
+    fn marker_of(entry: &Entry) -> u64 {
+        match entry {
+            Entry::IntentReceived { received_at, .. } => *received_at,
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    /// The `(position, marker)` pairs `read_from` yields, which is what every
+    /// consumer actually sees.
+    fn read_from(log: &MemLog, cursor: Position) -> Vec<(u64, u64)> {
+        log.read_from(cursor)
+            .unwrap()
+            .map(|(pos, e)| (pos.0, marker_of(&e)))
+            .collect()
+    }
+
+    #[test]
+    fn append_returns_the_position_written() {
+        let log = MemLog::new();
+        assert_eq!(log.append(received(0)).unwrap(), Position(0));
+        assert_eq!(log.append(received(1)).unwrap(), Position(1));
+        assert_eq!(log.append(received(2)).unwrap(), Position(2));
+    }
+
+    #[test]
+    fn head_is_exclusive_and_zero_when_empty() {
+        let log = MemLog::new();
+        assert_eq!(log.head(), Position::ZERO);
+        let pos = log.append(received(0)).unwrap();
+        assert_eq!(log.head(), pos.next());
+    }
+
+    #[test]
+    fn a_rejected_empty_batch_leaves_the_log_untouched() {
+        let log = MemLog::new();
+        let doorbell = log.subscribe();
+        assert!(matches!(
+            log.append_batch(Vec::new()),
+            Err(LogError::EmptyBatch)
+        ));
+        assert_eq!(log.head(), Position::ZERO);
+        assert!(!doorbell.has_changed().unwrap());
+    }
+
+    #[test]
+    fn append_rings_the_doorbell_with_the_written_position() {
+        let log = MemLog::new();
+        let mut doorbell = log.subscribe();
+
+        let pos = log.append(received(0)).unwrap();
+        assert!(doorbell.has_changed().unwrap());
+        assert_eq!(*doorbell.borrow_and_update(), pos);
+    }
+
+    #[test]
+    fn append_batch_rings_the_doorbell_once() {
+        let log = MemLog::new();
+        let mut doorbell = log.subscribe();
+
+        let last = log.append_batch(vec![received(0), received(1)]).unwrap();
+        assert_eq!(*doorbell.borrow_and_update(), last);
+        assert!(
+            !doorbell.has_changed().unwrap(),
+            "one batch must not wake a consumer twice"
+        );
+    }
+
+    #[test]
+    fn read_from_zero_yields_every_entry_with_its_position() {
+        let log = MemLog::new();
+        log.append_batch(vec![received(10), received(11), received(12)])
+            .unwrap();
+        assert_eq!(
+            read_from(&log, Position::ZERO),
+            vec![(0, 10), (1, 11), (2, 12)]
+        );
+    }
+
+    #[test]
+    fn read_from_a_cursor_yields_only_the_tail() {
+        let log = MemLog::new();
+        log.append_batch(vec![received(10), received(11), received(12)])
+            .unwrap();
+        assert_eq!(read_from(&log, Position(2)), vec![(2, 12)]);
+    }
+
+    #[test]
+    fn read_from_the_head_yields_nothing() {
+        let log = MemLog::new();
+        log.append(received(10)).unwrap();
+        assert!(read_from(&log, log.head()).is_empty());
+    }
+
+    #[test]
+    fn read_from_past_the_head_is_clamped_rather_than_panicking() {
+        let log = MemLog::new();
+        log.append(received(10)).unwrap();
+        assert!(read_from(&log, Position(99)).is_empty());
+    }
+
+    #[test]
+    fn a_panic_under_the_lock_does_not_poison_the_log() {
+        let log = MemLog::new();
+        log.append(received(0)).unwrap();
+
+        let hook = panic::take_hook();
+        panic::set_hook(Box::new(|_| {}));
+        let panicked = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = log.write();
+            panic!("boom");
+        }));
+        panic::set_hook(hook);
+        assert!(panicked.is_err());
+
+        assert_eq!(log.append(received(1)).unwrap(), Position(1));
+        assert_eq!(read_from(&log, Position::ZERO), vec![(0, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn append_batch_matches_append_and_wakes_consumers() {
+        let log = MemLog::new();
+        // Subscribing marks the current head as seen, so any change observed
+        // after this point came from the append below.
+        let doorbell = log.subscribe();
+
+        let last = log.append_batch(vec![received(1), received(2)]).unwrap();
+        assert_eq!(
+            last,
+            Position(1),
+            "position of the last entry, as append returns"
+        );
+        assert_eq!(log.head(), Position(2));
+        assert!(
+            doorbell.has_changed().unwrap(),
+            "a batched append must wake consumers like a single one"
+        );
+
+        assert!(matches!(
+            log.append_batch(vec![]),
+            Err(LogError::EmptyBatch)
+        ));
+    }
+    
+    #[test]
+    fn concurrent_appends_each_get_a_distinct_position() {
+        const THREADS: u64 = 8;
+        const PER_THREAD: u64 = 100;
+
+        let log = MemLog::new();
+        let positions: Vec<Position> = thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let log = &log;
+                    scope.spawn(move || {
+                        (0..PER_THREAD)
+                            .map(|i| log.append(received(t * PER_THREAD + i)).unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        let total = (THREADS * PER_THREAD) as usize;
+        assert_eq!(positions.len(), total);
+        assert_eq!(
+            positions.into_iter().collect::<HashSet<_>>().len(),
+            total,
+            "every append must own the position it returns"
+        );
+        assert_eq!(log.head(), Position(total as u64));
+    }
+}
