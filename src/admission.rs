@@ -699,4 +699,222 @@ mod tests {
         admit_and_append(&log, &gate, dummy(1), TEST_NOW).unwrap();
         assert_eq!(admitted(&log).len(), 1);
     }
+    /// A gate rebuilt from `log`, as a restart would rebuild it.
+    fn restarted(log: &MemLog) -> SyncMutex<Admission> {
+        SyncMutex::new(Admission::recover(log, guarantee()).unwrap())
+    }
+
+    /// An `IntentReceived` written straight to the log, bypassing the gate —
+    /// so recovery can be given histories the gate itself would never produce.
+    fn received(intent: &Intent, received_at: u64) -> Entry {
+        Entry::IntentReceived {
+            intent_id: intent.id(),
+            intent: intent.clone(),
+            received_at,
+        }
+    }
+
+    #[test]
+    fn an_empty_log_recovers_an_open_gate() {
+        let log = MemLog::new();
+
+        let gate = restarted(&log);
+
+        admit_and_append(&log, &gate, dummy(1), TEST_NOW).unwrap();
+        assert_eq!(admitted(&log).len(), 1);
+    }
+
+    #[test]
+    fn a_restart_does_not_let_a_replay_back_in() {
+        let log = MemLog::new();
+        let intent = dummy(1);
+        admit_and_append(&log, &gate(), intent.clone(), TEST_NOW).unwrap();
+
+        let gate = restarted(&log);
+        let err = admit_and_append(&log, &gate, intent.clone(), TEST_NOW + 1).unwrap_err();
+
+        assert_eq!(
+            rejection(err),
+            Rejection::Replay {
+                intent_id: intent.id()
+            },
+            "the whole point of recovery: a restart is not a fresh start for a submitter"
+        );
+        assert_eq!(admitted(&log).len(), 1);
+    }
+
+    #[test]
+    fn a_restart_keeps_each_submitters_nonce() {
+        let log = MemLog::new();
+        admit_and_append(&log, &gate(), with_nonce(1, 5), TEST_NOW).unwrap();
+
+        let gate = restarted(&log);
+
+        let err = admit_and_append(&log, &gate, with_nonce(1, 4), TEST_NOW + 1).unwrap_err();
+        assert_eq!(rejection(err), Rejection::StaleNonce { got: 4, last: 5 });
+        admit_and_append(&log, &gate, with_nonce(1, 6), TEST_NOW + 2).unwrap();
+        assert_eq!(admitted(&log).len(), 2);
+    }
+
+    #[test]
+    fn a_restart_keeps_submitters_independent() {
+        let log = MemLog::new();
+        let seed = gate();
+        admit_and_append(&log, &seed, with_nonce(1, 9), TEST_NOW).unwrap();
+        admit_and_append(&log, &seed, with_nonce(2, 2), TEST_NOW + 1).unwrap();
+
+        let gate = restarted(&log);
+
+        // Behind its own submitter's mark, but well ahead of the other's.
+        let err = admit_and_append(&log, &gate, with_nonce(2, 1), TEST_NOW + 2).unwrap_err();
+        assert_eq!(rejection(err), Rejection::StaleNonce { got: 1, last: 2 });
+        admit_and_append(&log, &gate, with_nonce(2, 3), TEST_NOW + 3).unwrap();
+    }
+
+    #[test]
+    fn recovery_takes_the_highest_nonce_the_log_holds() {
+        // Written directly, out of order: the gate would never admit 3 after 9,
+        // but recovery must not depend on the log being sorted to agree with it.
+        let log = MemLog::new();
+        log.append_batch(vec![
+            received(&with_nonce(1, 9), TEST_NOW),
+            received(&with_nonce(1, 3), TEST_NOW + 1),
+        ])
+        .unwrap();
+
+        let gate = restarted(&log);
+
+        let err = admit_and_append(&log, &gate, with_nonce(1, 4), TEST_NOW + 2).unwrap_err();
+        assert_eq!(
+            rejection(err),
+            Rejection::StaleNonce { got: 4, last: 9 },
+            "the counter is a high-water mark, so replaying a lower nonce cannot lower it"
+        );
+    }
+
+    #[test]
+    fn recovery_reads_only_admissions() {
+        let intent = dummy(1);
+        let log = MemLog::new();
+        log.append_batch(vec![
+            Entry::SlotCommitted {
+                slot: 0,
+                intents: vec![intent.id()],
+                consumed_up_to: Position::ZERO,
+                commitment: crate::log::Commitment([0; 32]),
+                committed_at_ms: TEST_NOW,
+            },
+            received(&intent, TEST_NOW),
+            Entry::AttestFailed {
+                slot: 0,
+                reason: "unrelated".into(),
+            },
+        ])
+        .unwrap();
+
+        let gate = restarted(&log);
+
+        let err = admit_and_append(&log, &gate, intent.clone(), TEST_NOW + 1).unwrap_err();
+        assert_eq!(
+            rejection(err),
+            Rejection::Replay {
+                intent_id: intent.id()
+            },
+            "the other stages' entries are stepped over, not misread as admissions"
+        );
+        // A different submitter is untouched by any of it.
+        admit_and_append(&log, &gate, dummy(2), TEST_NOW + 2).unwrap();
+    }
+
+    #[test]
+    fn an_expired_intent_stays_admitted_history() {
+        let log = MemLog::new();
+        let intent = dummy(1);
+        admit_and_append(&log, &gate(), intent.clone(), TEST_NOW).unwrap();
+        log.append(Entry::IntentExpired {
+            intent_id: intent.id(),
+            guarantee_deadline_ms: TEST_NOW + WINDOW_MS,
+            at_ms: TEST_NOW + WINDOW_MS + 1,
+        })
+        .unwrap();
+
+        let gate = restarted(&log);
+
+        let err = admit_and_append(&log, &gate, intent.clone(), TEST_NOW + 1).unwrap_err();
+        assert_eq!(
+            rejection(err),
+            Rejection::Replay {
+                intent_id: intent.id()
+            },
+            "an intent the sequencer dropped was still admitted once; resubmitting it is a replay"
+        );
+    }
+
+    #[test]
+    fn a_recovered_gate_enforces_the_guarantee_it_was_handed() {
+        // `recover` fills the rest of itself from `Default`, where the window is
+        // zero and every deadline would look promisable. This is what proves the
+        // configured window survived that.
+        let log = MemLog::new();
+        let gate = restarted(&log);
+        let window_closes = guarantee().deadline_for(TEST_NOW);
+
+        let err = admit_and_append(
+            &log,
+            &gate,
+            Intent {
+                deadline_ms: window_closes - 1,
+                ..dummy(1)
+            },
+            TEST_NOW,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            rejection(err),
+            Rejection::UnmeetableWindow {
+                deadline_ms: window_closes - 1,
+                guarantee_deadline_ms: window_closes,
+            }
+        );
+    }
+
+    #[test]
+    fn a_recovered_gate_appends_after_the_history_it_read() {
+        let log = MemLog::new();
+        admit_and_append(&log, &gate(), dummy(1), TEST_NOW).unwrap();
+
+        let gate = restarted(&log);
+        let (_, pos) = admit_and_append(&log, &gate, dummy(2), TEST_NOW + 1).unwrap();
+
+        assert_eq!(
+            pos,
+            Position(1),
+            "recovery reads the log, it does not rewind it"
+        );
+        assert_eq!(
+            admitted(&log),
+            vec![(dummy(1).id(), TEST_NOW), (dummy(2).id(), TEST_NOW + 1)]
+        );
+    }
+
+    #[test]
+    fn recovering_twice_over_reaches_the_same_gate() {
+        let log = MemLog::new();
+        let seed = gate();
+        admit_and_append(&log, &seed, with_nonce(1, 5), TEST_NOW).unwrap();
+        admit_and_append(&log, &seed, with_nonce(2, 1), TEST_NOW + 1).unwrap();
+
+        let once = Admission::recover(&log, guarantee()).unwrap();
+        let twice = Admission::recover(&log, guarantee()).unwrap();
+
+        assert_eq!(once.seen, twice.seen);
+        assert_eq!(once.nonces, twice.nonces);
+        assert_eq!(
+            once.seen,
+            seed.lock().unwrap().seen,
+            "a rebuilt gate holds exactly what the running one did"
+        );
+        assert_eq!(once.nonces, seed.lock().unwrap().nonces);
+    }
 }
