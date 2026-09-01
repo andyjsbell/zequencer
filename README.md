@@ -9,12 +9,16 @@ system proves *sequencing*, and every guarantee below is about ordering and
 inclusion rather than outcome.
 
 ```bash
-docker compose up --build       # serves on :3000
-# or, without Docker:
-cargo run                       # serves on :3000
-cargo test                      # 36 tests
-cargo bench --bench submit      # latency + throughput, see BENCH.md
+make            # lists every target
+make pipeline   # serves on :3000
+make check      # fmt + clippy + tests — the gate
+make bench      # latency + throughput, see BENCH.md
+make docker     # the same service in a container, on :3000
 ```
+
+Every target is a thin wrapper over cargo; nothing here depends on `make`, and
+`cargo run` / `cargo test` / `cargo bench --bench submit` still work unchanged.
+See [Make targets](#make-targets).
 
 `GET /health` returns `ok` once the process is serving; compose uses it as the
 container health check.
@@ -268,6 +272,43 @@ rather than `final_proven`.
 
 ---
 
+## Make targets
+
+`make` on its own lists them.
+
+| target | runs | |
+|---|---|---|
+| `check` | `fmt` then `lint` then `test` | the gate — must pass before every commit |
+| `test` | `cargo test` | 180 tests: 174 unit, 6 end-to-end |
+| `unit` | `cargo test --lib` | the in-module tests alone, no pipeline wiring |
+| `integration` | `cargo test --test pipeline -- --nocapture` | the end-to-end tests in `tests/` |
+| `pipeline` | `cargo run` | serves on :3000 |
+| `docker` | `docker compose up --build` | the same service, containerised |
+| `bench` | `cargo bench --bench submit` | latency and throughput |
+| `fmt` | `cargo fmt --check` | reports, never rewrites |
+| `lint` | `cargo clippy --all-targets -- -D warnings` | warnings are errors |
+| `clean` | `cargo clean` | |
+
+**`lint` covers every target, not just the library.** A benchmark that stopped
+compiling, or an unused import in a test, fails the gate rather than scrolling
+past — which is how the bench was caught spawning a sequencer with a zero slot
+duration, panicking its own background task and measuring an unconsumed log.
+
+**`fmt` checks rather than rewrites**, so `make check` cannot leave the working
+tree different from what it just verified. Run `cargo fmt` to actually format.
+
+`unit` and `integration` split the suite by what breaks them: `unit` needs no
+timers or tasks and finishes in under a second, while `integration` runs the
+real wiring and is the one to reach for after touching how the stages compose.
+
+Override the toolchain per invocation:
+
+```bash
+make test CARGO="cargo +nightly"
+```
+
+---
+
 ## Running in Docker
 
 ```bash
@@ -296,8 +337,7 @@ so there is nothing yet to persist.
 ## Invariants
 
 All four are enforced and tested, and each test was mutation-checked — the fix
-reverted, the test confirmed to fail. One suspected defect did not survive that
-check and is recorded as disproved in `GAPS.md` rather than quietly dropped.
+reverted, the test confirmed to fail.
 
 | invariant | test |
 |---|---|
@@ -305,6 +345,3 @@ check and is recorded as disproved in `GAPS.md` rather than quietly dropped.
 | Monotonic nonce progression per submitter | `concurrent_same_nonce_admits_exactly_one` |
 | Deterministic ordering under concurrent submission | `ordering_is_deterministic_under_arrival_permutations` |
 | The status machine skips no transition | `proving_cannot_skip_attestation` |
-
-`GAPS.md` tracks this implementation against the specification, including what
-remains open.
