@@ -3,6 +3,7 @@ use redb::ReadableTable;
 use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_with::{IfIsHumanReadable, hex::Hex, serde_as};
+use sha3::{Digest, Keccak256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::watch;
@@ -27,6 +28,16 @@ pub struct ProofHandle {
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signature(#[serde_as(as = "IfIsHumanReadable<Hex>")] pub [u8; 32]);
+
+impl Signature {
+    /// Deterministic stand-in. Not a signature — tests only.
+    pub fn mock_over(bytes: &[u8]) -> Self {
+        let mut h = Keccak256::new();
+        h.update(b"MOCKSIG");
+        h.update(bytes);
+        Signature(h.finalize().into())
+    }
+}
 
 #[serde_as]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
