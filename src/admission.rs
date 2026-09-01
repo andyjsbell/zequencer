@@ -12,6 +12,7 @@ use std::sync::Mutex as SyncMutex;
 /// means anything.
 pub const MAX_SLIPPAGE_BPS: u16 = 10_000;
 
+#[derive(Default)]
 pub struct Admission {
     guarantee: GuaranteeConfig,
     /// Every id admitted. Unbounded: a production gate would evict entries once
@@ -28,6 +29,23 @@ impl Admission {
             seen: HashSet::new(),
             nonces: HashMap::new(),
         }
+    }
+
+    /// Rebuild from the log. Without this a restart would let replays back in.
+    pub fn recover<L: IntentLog>(log: &L, guarantee: GuaranteeConfig) -> Result<Self, LogError> {
+        let mut a = Self {
+            guarantee,
+            ..Self::default()
+        };
+        for (_, entry) in log.read_from(Position::ZERO)? {
+            if let Entry::IntentReceived {
+                intent_id, intent, ..
+            } = entry
+            {
+                a.record(intent_id, intent.submitter, intent.nonce);
+            }
+        }
+        Ok(a)
     }
 
     fn check(&self, id: IntentId, intent: &Intent, now_ms: u64) -> Result<(), Rejection> {
