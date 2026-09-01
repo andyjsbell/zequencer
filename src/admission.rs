@@ -93,6 +93,13 @@ impl Admission {
         Ok(())
     }
 
+    /// What the gate is holding: (ids seen, submitters tracked). Neither is
+    /// ever evicted, so this is the state a flood of *valid* intents grows —
+    /// see the note on `seen`.
+    pub fn tracked(&self) -> (usize, usize) {
+        (self.seen.len(), self.nonces.len())
+    }
+
     fn record(&mut self, id: IntentId, submitter: Address, nonce: u64) {
         self.seen.insert(id);
         let high = self.nonces.entry(submitter).or_insert(nonce);

@@ -15,6 +15,7 @@
 use std::sync::Arc;
 use std::sync::Mutex as SyncMutex;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use zequencer::admission::{Admission, admit_and_append};
 use zequencer::attest::{Attester, MockEnclave};
@@ -28,6 +29,12 @@ use zequencer::testkit::{TEST_GUARANTEE, live_intent};
 const WARMUP: usize = 5_000;
 const SAMPLES: usize = 50_000;
 const BURST: usize = 20_000;
+/// Honest submits per contended run — the same count as `BURST`, so the
+/// one-thread row of section 3 is a like-for-like baseline.
+const HONEST: usize = 20_000;
+/// Spam submits between two reads of the stop flag. A relaxed load per attempt
+/// would be a larger share of the loop than the attempt it guards.
+const SPAM_CHUNK: usize = 64;
 
 fn pct(sorted: &[Duration], p: f64) -> Duration {
     let i = ((sorted.len() - 1) as f64 * p).round() as usize;
@@ -186,6 +193,128 @@ fn with_pipeline(batches: usize, per_batch: usize) -> Vec<f64> {
     out
 }
 
+/// What a spam thread submits. Each kind exits `Admission::check` at a
+/// different point, so together they bracket how much of the critical section
+/// an attacker has to pay for.
+#[derive(Clone, Copy)]
+enum Spam {
+    /// Caught at the `seen` set — the last check before the append, and so the
+    /// most of the critical section a rejection can consume.
+    Replay,
+    /// Caught at the nonce high-water mark, one check further still, but only
+    /// after the `seen` lookup has already missed.
+    StaleNonce,
+    /// Caught at the deadline, before either hash lookup — the shortest path
+    /// through the critical section there is.
+    Expired,
+}
+
+impl Spam {
+    fn name(self) -> &'static str {
+        match self {
+            Spam::Replay => "replay",
+            Spam::StaleNonce => "stale nonce",
+            Spam::Expired => "expired",
+        }
+    }
+}
+
+/// The intent a spam thread resubmits, plus whatever admitted history has to
+/// exist for it to be rejected. Each thread spams under its own address.
+fn seed_spam(log: &MemLog, adm: &SyncMutex<Admission>, who: u8, spam: Spam, now: u64) -> Intent {
+    match spam {
+        Spam::Replay => {
+            let intent = live_intent(who, 1, now);
+            admit_and_append(log, adm, intent.clone(), now).unwrap();
+            intent
+        }
+        Spam::StaleNonce => {
+            // The address opens at the top of the nonce space, so nothing can
+            // ever advance past it.
+            admit_and_append(log, adm, live_intent(who, u64::MAX, now), now).unwrap();
+            live_intent(who, 1, now)
+        }
+        Spam::Expired => Intent {
+            deadline_ms: now - 1,
+            ..live_intent(who, 1, now)
+        },
+    }
+}
+
+struct Contended {
+    p50: Duration,
+    p95: Duration,
+    honest_rate: f64,
+    spam_rate: f64,
+}
+
+/// Section 5 — the adversarial counterpart to section 3. One honest submitter
+/// runs against `spammers` threads submitting nothing but rejected work, so
+/// the only thing contended is the admission lock. `spammers = 0` reproduces
+/// the section 3 one-thread row and is the baseline the rest degrade from.
+///
+/// The asymmetry being measured: a rejection returns *before* the append, so a
+/// spammer takes and releases the lock faster than the submitter it starves.
+/// Rejection is the cheap side of the trade.
+///
+/// The spam rate is a floor, not a ceiling — each attempt clones an `Intent`,
+/// which allocates two `String`s. That cost is the attacker's and sits outside
+/// the lock, so it slows the attack without sheltering the victim.
+fn contended_burst(spammers: usize, spam: Spam) -> Contended {
+    let (log, adm) = fresh();
+    let now = now_millis();
+
+    let baits: Vec<Intent> = (0..spammers)
+        .map(|t| seed_spam(&log, &adm, t as u8, spam, now))
+        .collect();
+    // Well clear of the spammers' addresses, so the honest thread shares
+    // nothing with them but the lock itself.
+    let honest_work = batch(200, HONEST);
+
+    let done = AtomicBool::new(false);
+    let attempts = AtomicU64::new(0);
+
+    let (mut samples, honest_elapsed) = std::thread::scope(|scope| {
+        for bait in baits {
+            let (log, adm, done, attempts) = (&log, &adm, &done, &attempts);
+            scope.spawn(move || {
+                let mut mine = 0u64;
+                while !done.load(Ordering::Relaxed) {
+                    for _ in 0..SPAM_CHUNK {
+                        admit_and_append(&**log, adm, bait.clone(), now).unwrap_err();
+                    }
+                    mine += SPAM_CHUNK as u64;
+                }
+                attempts.fetch_add(mine, Ordering::Relaxed);
+            });
+        }
+
+        let honest = scope.spawn(|| {
+            let mut samples = Vec::with_capacity(HONEST);
+            let start = Instant::now();
+            for intent in honest_work {
+                let t = Instant::now();
+                admit_and_append(&*log, &adm, intent, now).unwrap();
+                samples.push(t.elapsed());
+            }
+            let elapsed = start.elapsed();
+            done.store(true, Ordering::Relaxed);
+            (samples, elapsed)
+        });
+        honest.join().unwrap()
+    });
+
+    samples.sort_unstable();
+    Contended {
+        p50: pct(&samples, 0.50),
+        p95: pct(&samples, 0.95),
+        honest_rate: rate(HONEST, honest_elapsed),
+        // Charged over the honest thread's window: what the victim endured,
+        // not what the spammers managed across their own slightly longer lives.
+        spam_rate: rate(attempts.load(Ordering::Relaxed) as usize, honest_elapsed),
+    }
+}
+
 fn main() {
     println!("\nsequencer — submit path benchmark");
     println!("  measuring admit_and_append (hash + checks + append), MemLog, no HTTP\n");
@@ -236,6 +365,35 @@ fn main() {
             total / t as f64,
             us(p95)
         );
+    }
+
+    println!("\ncontention: {HONEST} honest submits against threads that only get rejected");
+    println!(
+        "  {:<13}{:>9}{:>13}{:>13}{:>13}{:>13}",
+        "spam", "threads", "honest p50", "honest p95", "honest/s", "spam/s"
+    );
+    let base = contended_burst(0, Spam::Replay);
+    println!(
+        "  {:<13}{:>9}{:>11.2}us{:>11.2}us{:>13.0}{:>13}",
+        "none",
+        0,
+        us(base.p50),
+        us(base.p95),
+        base.honest_rate,
+        "-"
+    );
+    for spam in [Spam::Replay, Spam::StaleNonce, Spam::Expired] {
+        for t in [1usize, 4, 8] {
+            let c = contended_burst(t, spam);
+            println!(
+                "  {:<13}{t:>9}{:>11.2}us{:>11.2}us{:>13.0}{:>13.0}",
+                spam.name(),
+                us(c.p50),
+                us(c.p95),
+                c.honest_rate,
+                c.spam_rate
+            );
+        }
     }
 
     println!("\nsubmit rate with the pipeline consuming the log");

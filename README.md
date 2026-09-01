@@ -202,20 +202,27 @@ would sit if they were real, and what is missing regardless.
 **Submission is unauthenticated — the largest gap.** `Intent` carries no
 signature, so `submitter` is a claimed address. Anyone can submit on anyone's
 behalf, and because nonces must strictly advance, anyone can burn another
-account's nonce space. A real deployment signs the intent and verifies it in
-`Admission::check` before anything else. Nothing else in the threat model
-matters until this is closed.
+account's nonce space — one forged submit at `u64::MAX` closes an account for
+good, which `tests/adversarial.rs` demonstrates rather than describes. A real
+deployment signs the intent and verifies it in `Admission::check` before anything
+else. Nothing else in the threat model matters until this is closed.
 
 **The sequencer is trusted for ordering.** The TEE attests the *commitment*, not
 that the commitment follows the published policy — so a malicious sequencer can
 order badly and still get a valid preconfirmation. It cannot later change what it
 committed to, which is a real property, but it can commit to the wrong thing.
 The fix is architectural: compute the ordering *inside* the enclave so the
-attestation covers the policy, not just the result.
+attestation covers the policy, not just the result. `tests/adversarial.rs` drives
+this end to end: a slot committed in reverse of the policy obtains a preconf that
+`verify_preconf` accepts, and the only check that catches it needs the buffer the
+sequencer held — which no holder has.
 
 **The inclusion guarantee is self-enforced.** The sequencer honours it against
 itself; a censored client has no recourse and no escape hatch. A real L2 needs
-forced inclusion via L1.
+forced inclusion via L1. Only the sequencer writes `IntentExpired`, so a censoring
+one never adjudicates the miss: the receipt sits at `overdue` rather than
+reaching `missed`. `overdue` is therefore the signal a client has to act on —
+waiting for `missed` waits on the censor to confess.
 
 **Verification shifts trust rather than removing it.** `MockVerifier` pins the
 enclave measurement, which is the check that decides *what code* signed —
@@ -227,9 +234,15 @@ none of that is here. TEEs remain exposed to side channels and rollback.
 bidding maximum priority costs nothing. Fee collection is out of scope here but
 the policy is meaningless without it.
 
-**Denial of service.** No rate limiting, no proof of work, no fee. Admission's
-replay set and the prover's pending map both grow without bound and need
-eviction past the longest guarantee window.
+**Denial of service, measured.** No rate limiting, no proof of work, no fee. A
+rejection returns before the log append, so spam is *cheaper* per attempt than an
+honest submit while contending for the same admission lock: eight spam threads
+cost an honest submitter 15.5× its throughput and 54× its p95, and each spammer
+gets roughly twice the honest thread's share of the lock. See the contended-burst
+section of `BENCH.md`, and `tests/adversarial.rs` for the correctness side — the
+honest submitter is slowed, never dropped or duplicated. Separately, admission's
+replay set and the prover's pending map both grow without bound and need eviction
+past the longest guarantee window.
 
 **What does hold, mocks aside:** replay and nonce ordering cannot be raced —
 admission's lock spans check *and* append; intent identity is content-derived, so
@@ -279,7 +292,7 @@ rather than `final_proven`.
 | target | runs | |
 |---|---|---|
 | `check` | `fmt` then `lint` then `test` | the gate — must pass before every commit |
-| `test` | `cargo test` | 180 tests: 174 unit, 6 end-to-end |
+| `test` | `cargo test` | 197 tests: 174 unit, 17 adversarial, 6 end-to-end |
 | `unit` | `cargo test --lib` | the in-module tests alone, no pipeline wiring |
 | `integration` | `cargo test --test pipeline -- --nocapture` | the end-to-end tests in `tests/` |
 | `pipeline` | `cargo run` | serves on :3000 |
@@ -300,6 +313,16 @@ tree different from what it just verified. Run `cargo fmt` to actually format.
 `unit` and `integration` split the suite by what breaks them: `unit` needs no
 timers or tasks and finishes in under a second, while `integration` runs the
 real wiring and is the one to reach for after touching how the stages compose.
+
+`cargo test --test adversarial` is the third suite: it drives the attacks
+rather than asserting the invariants they target. Fee floods, id grinding,
+replay and rejection storms, nonce-space burning, a sequencer that orders
+maliciously, one that equivocates, one that censors. It is deliberately honest
+about the attacks that *work* — see the threat model — and asserts what they
+actually achieve rather than pretending they fail. Nothing in it is
+timing-sensitive; the cost of a rejection flood is measured in `BENCH.md`.
+`make integration` runs the pipeline suite only, so reach for the command above
+directly, or `make test` for everything.
 
 Override the toolchain per invocation:
 
