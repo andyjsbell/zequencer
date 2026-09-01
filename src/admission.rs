@@ -153,6 +153,7 @@ mod tests {
         GuaranteeConfig {
             window_ms: WINDOW_MS,
             slot_duration: Duration::from_millis(100),
+            max_slots: 10,
         }
     }
 

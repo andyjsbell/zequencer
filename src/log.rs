@@ -20,12 +20,6 @@ impl Position {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProofHandle {
-    pub proof: Vec<u8>,
-    pub vkey_hash: [u8; 32],
-}
-
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signature(#[serde_as(as = "IfIsHumanReadable<Hex>")] pub [u8; 32]);

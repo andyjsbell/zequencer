@@ -9,10 +9,15 @@ use tokio::time::MissedTickBehavior;
 /// The inclusion promise made at admission: an admitted intent is sequenced
 /// within this window of its arrival, or dropped as `IntentExpired` rather than
 /// sequenced late.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct GuaranteeConfig {
     pub window_ms: u64,
     pub slot_duration: Duration,
+    /// How many slot closes the window covers — the same promise as
+    /// `window_ms`, in the unit a client reasons about. Reported in every
+    /// receipt, and not derived from the two fields above, so a cadence change
+    /// has to update it too.
+    pub max_slots: u32,
 }
 
 impl GuaranteeConfig {
@@ -577,6 +582,7 @@ mod tests {
         GuaranteeConfig {
             window_ms: 1_000,
             slot_duration: Duration::from_millis(100),
+            max_slots: 10,
         }
     }
 
