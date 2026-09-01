@@ -1,3 +1,4 @@
+use std::sync::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_with::{IfIsHumanReadable, hex::Hex, serde_as};
 use crate::intent::{Intent, IntentId};
@@ -6,6 +7,13 @@ use tokio::sync::watch;
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
 )]
 pub struct Position(pub u64);
+
+impl Position {
+    pub const ZERO: Self = Position(0);
+    pub fn next(self) -> Self {
+        Position(self.0 + 1)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofHandle {
@@ -88,4 +96,35 @@ pub trait IntentLog: Send + Sync {
     fn subscribe(&self) -> watch::Receiver<Position>;
 }
 
+pub struct MemLog {
+    entries: RwLock<Vec<Entry>>,
+    doorbell: watch::Sender<Position>,
+}
+
+impl Default for MemLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MemLog {
+    pub fn new() -> Self {
+        Self {
+            entries: RwLock::new(Vec::new()),
+            doorbell: watch::Sender::new(Position::ZERO),
+        }
+    }
+
+    // The only writers are `push` and `extend`, so a panic under the lock can
+    // leave the log short but never structurally torn. Recovering from poison
+    // beats turning one unrelated panic into a permanent failure for every
+    // consumer.
+    fn read(&self) -> RwLockReadGuard<'_, Vec<Entry>> {
+        self.entries.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, Vec<Entry>> {
+        self.entries.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
