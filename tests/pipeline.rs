@@ -152,7 +152,6 @@ async fn attest_failure_is_excluded_from_proof_ranges() {
 #[tokio::test]
 async fn a_missed_window_expires_the_intent() {
     let cfg = GuaranteeConfig {
-        window_ms: 5,
         slot_duration: Duration::from_millis(5),
         max_slots: 1,
     };

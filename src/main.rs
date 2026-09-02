@@ -56,13 +56,7 @@ async fn main() -> anyhow::Result<()> {
         println!("demo prover will refuse these slot ranges: {fail_slots:?}");
     }
 
-    // Stated rather than defaulted: `GuaranteeConfig::default()` leaves the slot
-    // duration at zero, and `tokio::time::interval` panics on a zero period, so
-    // the sequencer died on its first tick and took the process with it.
-    // The 2 s window the README documents, stated as all three fields so they
-    // agree: 20 slots × 100 ms is exactly window_ms.
-    let guarantee = GuaranteeConfig {
-        window_ms: 2_000,
+   let guarantee = GuaranteeConfig {
         slot_duration: Duration::from_millis(100),
         max_slots: 20,
     };

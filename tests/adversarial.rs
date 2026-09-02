@@ -31,7 +31,6 @@ const WINDOW_MS: u64 = 1_000;
 
 fn guarantee() -> GuaranteeConfig {
     GuaranteeConfig {
-        window_ms: WINDOW_MS,
         slot_duration: Duration::from_millis(100),
         max_slots: 10,
     }

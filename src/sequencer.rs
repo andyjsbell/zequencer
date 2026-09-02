@@ -11,19 +11,17 @@ use tokio::time::MissedTickBehavior;
 /// sequenced late.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GuaranteeConfig {
-    pub window_ms: u64,
     pub slot_duration: Duration,
-    /// How many slot closes the window covers — the same promise as
-    /// `window_ms`, in the unit a client reasons about. Reported in every
-    /// receipt, and not derived from the two fields above, so a cadence change
-    /// has to update it too.
     pub max_slots: u32,
 }
 
 impl GuaranteeConfig {
     /// The moment the promise made to an intent arriving at `now_ms` runs out.
     pub fn deadline_for(&self, now_ms: u64) -> u64 {
-        now_ms + self.window_ms
+        now_ms + self.window_size()
+    }
+    pub fn window_size(&self) -> u64 {
+        (self.slot_duration.as_millis() * self.max_slots as u128) as u64
     }
 }
 
@@ -580,7 +578,6 @@ mod tests {
 
     fn guarantee() -> GuaranteeConfig {
         GuaranteeConfig {
-            window_ms: 1_000,
             slot_duration: Duration::from_millis(100),
             max_slots: 10,
         }

@@ -20,7 +20,6 @@ pub const TEST_NOW: u64 = 1_700_000_000_000;
 /// Short slots so pipeline tests finish quickly, but a window generous enough
 /// that CI scheduling noise cannot expire an intent that is not under test.
 pub const TEST_GUARANTEE: GuaranteeConfig = GuaranteeConfig {
-    window_ms: 1_000,
     slot_duration: Duration::from_millis(5),
     max_slots: 200,
 };

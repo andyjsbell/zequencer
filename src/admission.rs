@@ -181,17 +181,14 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::watch;
 
-    /// Comfortably inside `dummy`'s 60s deadline, so the window rule only fires
-    /// where a test means it to.
-    const WINDOW_MS: u64 = 1_000;
-
+    const SLOT_DURATION_MS: u64 = 100;
+    const MAX_SLOTS: u32 = 10;
     /// Admission only ever consults `deadline_for`, so the slot cadence is
     /// nominal here — it is the sequencer that acts on it.
     fn guarantee() -> GuaranteeConfig {
         GuaranteeConfig {
-            window_ms: WINDOW_MS,
-            slot_duration: Duration::from_millis(100),
-            max_slots: 10,
+            slot_duration: Duration::from_millis(SLOT_DURATION_MS),
+            max_slots: MAX_SLOTS,
         }
     }
 
@@ -696,7 +693,7 @@ mod tests {
 
     #[test]
     fn a_deadline_inside_the_guarantee_window_cannot_be_promised() {
-        let window_closes = TEST_NOW + WINDOW_MS;
+        let window_closes = TEST_NOW + ((MAX_SLOTS as u64) * SLOT_DURATION_MS);
 
         assert_eq!(
             rejected(
@@ -889,10 +886,12 @@ mod tests {
         let log = MemLog::new();
         let intent = dummy(1);
         admit_and_append(&log, &gate(), intent.clone(), TEST_NOW).unwrap();
+        let window_ms = (MAX_SLOTS as u64) * SLOT_DURATION_MS;
+        let window_closes = TEST_NOW + window_ms;
         log.append(Entry::IntentExpired {
             intent_id: intent.id(),
-            guarantee_deadline_ms: TEST_NOW + WINDOW_MS,
-            at_ms: TEST_NOW + WINDOW_MS + 1,
+            guarantee_deadline_ms: window_closes,
+            at_ms: TEST_NOW + window_ms + 1,
         })
         .unwrap();
 
